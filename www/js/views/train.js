@@ -18,7 +18,7 @@ import {
 } from '../model.js';
 import { fmtClock, fmtRest, fmtDelta, toNumOrNull } from '../util.js';
 import {
-  syncNotification, stopNotification, readNativeState, vibrate, notifyRestDone,
+  syncNotification, stopNotification, readNativeState, vibrate, notifyRestDone, isNative,
 } from '../native.js';
 import {
   esc, icon, mascot, openSheet, closeSheet, confirmSheet, toast, stepLabel, targetText,
@@ -34,14 +34,28 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
 
   let phase = 'set';          // set | confirm | rest | continuous | done
   let chosenRestMs = null;    // 灵活调整选定的本组间歇
-  let restEndTs = 0;
-  let restTotalMs = 0;
-  let confirmAt = 0;
-  let lastEntry = null;
+  const saved = session.playerState || {};
+  let restEndTs = Number(saved.restEndTs) || 0;
+  let restTotalMs = Number(saved.restTotalMs) || 0;
+  let confirmAt = Number(saved.confirmAt) || 0;
+  let continuousStartedAt = Number(saved.continuousStartedAt) || 0;
+  let continuousStepId = saved.continuousStepId || '';
+  let lastEntry = session.entries[session.entries.length - 1] || null;
   let ticker = null;
   let sheetApi = null;
   let settled = false;        // 询问是否已落定，防重复点击/重复兜底
   let timeoutHandled = false; // 兜底只处理一次，防重复触发
+  let started = false;
+  let destroyed = false;
+  let readingNative = false;
+
+  // 同步首屏仍可见；原生读取期间不接受训练操作，避免旧快照覆盖新决策。
+  root.addEventListener('click', (event) => {
+    if (destroyed || readingNative) {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+    }
+  }, true);
 
   /* ------------------------------------------------------------ 生命周期 */
 
@@ -53,9 +67,10 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
    * 而这两种情况恰恰要靠它才能和原生那边对账
    * （原生可能已经按 confirmDeadline 自动推进了）。
    */
-  function setPhase(p) {
-    phase = p;
-    session.uiPhase = p;
+  function saveState() {
+    if (destroyed || session.status !== 'ongoing') return;
+    session.uiPhase = phase;
+    session.playerState = { restEndTs, restTotalMs, confirmAt, continuousStartedAt, continuousStepId };
     try {
       store.saveOngoing(session);
     } catch (e) {
@@ -63,115 +78,135 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
     }
   }
 
-  /**
-   * 启动播放器。
-   *
-   * 刻意**先同步渲染一次**，再异步去跟原生对账：
-   * 调用方（main.js、集成测试）习惯 start() 之后立刻就能看到界面，
-   * 渲染要是被 await 挡住，界面会慢一拍才出来。
-   *
-   * 对账可能改变阶段（认领原生那边已经在走的倒计时），
-   * 所以对账完再重绘一次。
-   */
-  function start() {
-    // 上次停在哪个阶段（从存盘里读回来的）
-    const prevPhase = session.uiPhase || 'set';
+  function setPhase(p) {
+    phase = p;
+    saveState();
+  }
 
-    if (isLastStep(session) || session.status !== 'ongoing') {
-      if (session.status === 'ongoing' && isLastStep(session)) finishNow();
-      else { phase = 'done'; session.uiPhase = 'done'; }
+  function enterCurrentStep() {
+    const step = currentStep(session);
+    phase = step && step.continuous ? 'continuous' : 'set';
+    restEndTs = 0;
+    restTotalMs = 0;
+    confirmAt = 0;
+    if (step && step.continuous) {
+      if (continuousStepId !== step.id || !continuousStartedAt) continuousStartedAt = Date.now();
+      continuousStepId = step.id;
     } else {
-      const step = currentStep(session);
-      phase = step.continuous ? 'continuous' : 'set';
+      continuousStartedAt = 0;
+      continuousStepId = '';
+    }
+    saveState();
+  }
+
+  /** 首屏同步渲染，但必须先读原生，完成对账后才允许写回。 */
+  function start() {
+    if (started || destroyed) return;
+    started = true;
+    const savedPhase = session.uiPhase || 'set';
+    const prevPhase = savedPhase === 'confirm' || savedPhase === 'rest' ? savedPhase : 'set';
+    if (prevPhase === 'set') enterCurrentStep();
+    if (isLastStep(session) || session.status !== 'ongoing') {
+      if (session.status === 'ongoing') finishNow();
+      else { phase = 'done'; render(); }
+      return Promise.resolve();
     }
 
-    ticker = setInterval(onTick, 250);
+    readingNative = isNative();
+    phase = prevPhase === 'confirm' || prevPhase === 'rest'
+      ? prevPhase : (currentStep(session).continuous ? 'continuous' : 'set');
     render();
-    pushNative();
-
-    reconcileWithNative(prevPhase).then(() => {
+    ticker = setInterval(onTick, 250);
+    const ready = () => {
+      if (destroyed) return;
+      readingNative = false;
+      if (phase === 'done') return;
+      saveState();
       render();
+      if (phase === 'confirm') openConfirm(true);
       pushNative();
-    });
+    };
+    if (!readingNative) {
+      if (prevPhase === 'rest' && restEndTs <= Date.now()) onRestDone();
+      if (prevPhase === 'confirm') confirmAt = confirmAt || Date.now();
+      ready();
+      return Promise.resolve();
+    }
+    return reconcileWithNative(prevPhase).then(ready);
   }
 
   function destroy() {
+    if (destroyed) return;
+    destroyed = true;
     if (ticker) clearInterval(ticker);
     ticker = null;
     closeSheet();
+    sheetApi = null;
   }
 
   /* --------------------------------------------------- 与原生对账（兜底） */
 
-  /**
-   * 与原生对账。
-   *
-   * 原生在「询问」阶段被锁屏时，会按 confirmDeadline 自动套用计划间歇
-   * （phase 变 'rest'）。JS 这边必须认领它，否则：
-   *   ① 间歇从头再数一遍（JS 自己起一个 restEndTs）；
-   *   ② 这一组没有记录（用户回来还得再点一次「完成本组」）；
-   *   ③ 「询问超时，已按计划推进」这句话永远不出现。
-   *
-   * prevPhase 是存盘里读回来的「上次停在哪」——
-   * 只有它能区分「原生在自动推进」和「原生只是还在上一轮的休息里」。
-   */
   async function reconcileWithNative(prevPhase) {
     const ns = await readNativeState();
-    if (!ns || ns.sessionId !== session.id) {
-      // 原生那边根本没有这次训练的状态：回到正常流程，让用户自己决定
-      if (prevPhase === 'rest') { phase = 'set'; restEndTs = 0; restTotalMs = 0; }
+    if (destroyed) return;
+    const sameSession = ns && ns.sessionId === session.id;
+    const sameStep = sameSession && (!ns.stepId || ns.stepId === currentStep(session)?.id);
+    if (prevPhase === 'confirm') {
+      if (sameStep && (ns.phase === 'rest' || ns.phase === 'ready' || ns.autoApplied)) {
+        adoptAutoApplied(ns);
+      } else {
+        phase = 'confirm';
+        confirmAt = (sameStep && Number(ns.anchorTs)) || confirmAt || Date.now();
+        const deadline = (sameStep && Number(ns.confirmDeadline))
+          || (settings.confirmTimeoutMs > 0 ? confirmAt + settings.confirmTimeoutMs : 0);
+        if (deadline > 0 && deadline <= Date.now()) {
+          const step = currentStep(session);
+          adoptAutoApplied({ restEndTs: deadline + step.restPlannedMs, plannedRestMs: step.restPlannedMs });
+        }
+      }
       return;
     }
-
-    const nativeResting = ns.phase === 'rest' && ns.restEndTs > Date.now();
-
-    if (prevPhase === 'confirm' && nativeResting) {
-      // 询问期间锁屏/切走了，原生已经替我们按计划推进
-      adoptAutoApplied(ns);
-      return;
-    }
-    if (prevPhase === 'confirm' && ns.phase === 'confirm') {
-      // 原生那边还在等选择（还没到兜底时间）→ 把询问重新摆出来，
-      // 顺便把兜底时间重新给满，用户不用接着上次那点残时间等
-      phase = 'confirm';
-      confirmAt = Date.now();
-      openConfirm();
-      return;
-    }
-    if (prevPhase === 'rest' && nativeResting) {
-      // 接着上次的倒计时，别从头再数
+    if (prevPhase === 'rest') {
       phase = 'rest';
-      restTotalMs = Number(ns.plannedRestMs) || 0;
-      chosenRestMs = restTotalMs;
-      restEndTs = ns.restEndTs;
-      session.uiPhase = 'rest';
+      if (sameSession && (ns.phase === 'rest' || ns.phase === 'ready')) {
+        restEndTs = Number(ns.restEndTs) || restEndTs;
+        restTotalMs = Number(ns.plannedRestMs) || restTotalMs;
+        if (ns.phase === 'ready') restEndTs = Math.min(restEndTs, Date.now());
+      }
+      if (restEndTs <= Date.now()) onRestDone();
       return;
     }
-    // 原生那边没有可接的倒计时 → 回到正常流程
-    if (prevPhase === 'rest') { phase = 'set'; restEndTs = 0; restTotalMs = 0; }
+    if (sameStep && ns.phase === 'continuous' && currentStep(session).continuous) {
+      continuousStartedAt = Number(ns.anchorTs) || continuousStartedAt;
+      continuousStepId = currentStep(session).id;
+    }
+    enterCurrentStep();
   }
 
   function adoptAutoApplied(ns) {
+    if (destroyed || settled) return;
     const step = currentStep(session);
-    if (!step || settled) return;
+    if (!step) return;
     settled = true;
-    // 落一条 decision='auto' 的记录，让日后回看知道"这次是自动推进的"
-    lastEntry = completeStep(session, {}, { restMs: step.restPlannedMs, decision: 'auto' });
+    const isLast = session.cursor + 1 >= session.timeline.length;
+    restTotalMs = isLast ? 0 : Math.max(0, Number(ns.plannedRestMs) || step.restPlannedMs);
+    lastEntry = completeStep(session, {}, { restMs: restTotalMs, decision: 'auto' });
+    chosenRestMs = restTotalMs;
+    restEndTs = Number(ns.restEndTs) || 0;
     phase = 'rest';
-    session.uiPhase = 'rest';
-    restTotalMs = step.restPlannedMs;
-    chosenRestMs = step.restPlannedMs;
-    restEndTs = ns.restEndTs;
-    store.saveOngoing(session);
+    saveState();
     closeSheet();
+    sheetApi = null;
     toast('询问超时，已按计划推进');
-    render();
-    pushNative();
+    if (ns.phase === 'ready' || !restTotalMs || restEndTs <= Date.now()) onRestDone();
+    else { render(); pushNative(); }
   }
+
 
   /* ----------------------------------------------------------- 倒计时 */
 
   function onTick() {
+    if (destroyed || readingNative || phase === 'done') return;
     const now = Date.now();
     if (phase === 'confirm' && !settled) {
       const limit = settings.confirmTimeoutMs;
@@ -186,7 +221,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
         return;
       }
     }
-    if (phase === 'confirm' || phase === 'rest') renderTickerOnly();
+    renderTickerOnly();
   }
 
   /**
@@ -198,21 +233,33 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
    * 用户看到的剩余时间和通知栏里的对不上。
    */
   async function onConfirmTimeout() {
-    if (settled || timeoutHandled) return;
+    if (destroyed || readingNative || settled || timeoutHandled) return;
     timeoutHandled = true;
+    readingNative = true;
     let ns = null;
     try { ns = await readNativeState(); } catch (e) { ns = null; }
-    const nativeResting = !!ns && ns.sessionId === session.id
-      && ns.phase === 'rest' && ns.restEndTs > Date.now();
-    if (nativeResting) { adoptAutoApplied(ns); return; }
+    if (destroyed) return;
+    readingNative = false;
+    if (phase !== 'confirm' || settled) return;
+    const nativeApplied = ns && ns.sessionId === session.id
+      && (!ns.stepId || ns.stepId === currentStep(session)?.id)
+      && (ns.phase === 'rest' || ns.phase === 'ready' || ns.autoApplied);
+    if (nativeApplied) { adoptAutoApplied(ns); return; }
     const step = currentStep(session);
     if (!step) { finishNow(); return; }
-    applyDecision('plan', step.restPlannedMs, 'auto');
+    // 以询问截止时间为锚点，后台 JS 冻结也不会重新开始整段休息。
+    adoptAutoApplied({
+      restEndTs: confirmAt + settings.confirmTimeoutMs + step.restPlannedMs,
+      plannedRestMs: step.restPlannedMs,
+    });
   }
 
   function renderTickerOnly() {
     const now = Date.now();
-    if (phase === 'rest') {
+    if (phase === 'continuous') {
+      const clock = root.querySelector('[data-cont-clock]');
+      if (clock) clock.textContent = fmtClock(Math.max(0, now - (continuousStartedAt || now)));
+    } else if (phase === 'rest') {
       const el = root.querySelector('[data-ticker]');
       if (!el) return;
       const left = Math.max(0, restEndTs - now);
@@ -251,18 +298,26 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
     chosenRestMs = null;
     settled = false;
     if (!step) { finishNow(); return; }
-    phase = step.continuous ? 'continuous' : 'set';
-    session.uiPhase = phase;
-    try { store.saveOngoing(session); } catch (e) { /* 配额满不阻断 */ }
+    enterCurrentStep();
     render();
     pushNative();
   }
 
   /* --------------------------------------------------- 询问 → 决策 */
 
-  function openConfirm() {
-    if (settled) return;
-    confirmAt = Date.now();
+  function guardSheet(api) {
+    api.root.addEventListener('click', (event) => {
+      if (destroyed || readingNative) {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+      }
+    }, true);
+    return api;
+  }
+
+  function openConfirm(resume = false) {
+    if (destroyed || readingNative || settled) return;
+    if (!resume && phase !== 'confirm') confirmAt = Date.now();
     timeoutHandled = false;
     // 这一组做完之后还有没有组？没有的话就没有间歇可言
     const isLast = session.cursor + 1 >= session.timeline.length;
@@ -273,7 +328,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
     const planned = step.restPlannedMs;
     const limit = settings.confirmTimeoutMs;
 
-    sheetApi = openSheet({
+    sheetApi = guardSheet(openSheet({
       title: '本组完成 · 下一步？',
       dismissible: false,
       body: `
@@ -294,7 +349,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
         $('[data-plan]').addEventListener('click', () => applyDecision('plan', planned, 'plan'));
         $('[data-flex]').addEventListener('click', () => openFlexPanel());
       },
-    });
+    }));
   }
 
   /** 灵活调整面板：把「原计划间歇」放在最显眼的位置当参考 */
@@ -312,7 +367,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
     // 记录里会写着"实际间歇 60 秒"，却根本没有那次倒计时。
     const isLast = session.cursor + 1 >= session.timeline.length;
 
-    openSheet({
+    sheetApi = guardSheet(openSheet({
       title: '灵活调整本组间歇',
       body: `
         <div class="stack">
@@ -380,25 +435,27 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
         $$('[data-presets] .chip').forEach((c) => {
           c.addEventListener('click', () => { value = Number(c.dataset.ms); paint(); });
         });
-        $('[data-plus]').addEventListener('click', () => { value += 15000; paint(); });
-        $('[data-minus]').addEventListener('click', () => { value = Math.max(0, value - 15000); paint(); });
+        $('[data-plus]')?.addEventListener('click', () => { value += 15000; paint(); });
+        $('[data-minus]')?.addEventListener('click', () => { value = Math.max(0, value - 15000); paint(); });
 
         $('[data-add-set]').addEventListener('click', () => {
           addSetToItem(session, step.itemId);
-          store.saveOngoing(session);
+          saveState();
           toast('已加 1 组');
+          openFlexPanel();
         });
         $('[data-del-set]').addEventListener('click', () => {
           const idx = session.timeline.findIndex((s, i) => i > session.cursor && s.itemId === step.itemId);
           if (idx < 0) { toast('这个动作已经没有可减的组了'); return; }
           removeStep(session, idx, '临时减组');
-          store.saveOngoing(session);
+          saveState();
           toast('已减 1 组');
+          openFlexPanel();
         });
         $('[data-skip]').addEventListener('click', () => {
           if (session.cursor + 1 >= session.timeline.length) { toast('已经是最后一组了'); return; }
           const removed = removeStep(session, session.cursor + 1, '跳过下一组');
-          if (removed) { store.saveOngoing(session); toast(`已跳过：${removed.itemName}`); }
+          if (removed) { saveState(); toast(`已跳过：${removed.itemName}`); openFlexPanel(); }
         });
         $('[data-end-item]').addEventListener('click', () => {
           let n = 0;
@@ -407,8 +464,9 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
             removeStep(session, session.cursor + 1, '结束本动作');
             n += 1;
           }
-          store.saveOngoing(session);
+          saveState();
           toast(n ? `本动作剩余 ${n} 组已略过` : '这个动作已经到最后一组');
+          openFlexPanel();
         });
 
         $('[data-start]').addEventListener('click', () => {
@@ -425,12 +483,12 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
 
         paint();
       },
-    });
+    }));
   }
 
   /** 落定本次决策并进入休息（或直接推进） */
   function applyDecision(kind, restMs, source) {
-    if (settled) return;
+    if (destroyed || readingNative || settled) return;
     settled = true;
     const step = currentStep(session);
     if (!step) { finishNow(); return; }
@@ -454,7 +512,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
       restTotalMs = effectiveRest;
       restEndTs = Date.now() + effectiveRest;
     }
-    store.saveOngoing(session);
+    saveState();
     closeSheet();
 
     if (!goingRest) {
@@ -502,7 +560,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
         session.uiPhase = 'rest';
         restTotalMs = restMs;
         restEndTs = Date.now() + restMs;
-        store.saveOngoing(session);
+        saveState();
       } else {
         onRestDone();
         pushNative();
@@ -516,6 +574,9 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
   }
 
   function finishNow() {
+    if (destroyed || phase === 'done') return;
+    if (ticker) clearInterval(ticker);
+    ticker = null;
     finishSession(session, isLastStep(session) && session.entries.length ? 'done' : 'aborted');
     // 阶段要在 store.finishSession 之前定下来：
     // finishSession 会把 ex.ongoing 清掉，之后再存就等于把进行中的训练又写回来了。
@@ -664,19 +725,10 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
       if (!gone) { toast('这一组跳不了'); return; }
       store.saveOngoing(session);
       if (isLastStep(session)) finishNow();
-      else { toast(`已跳过：${gone.itemName}`); render(); }
+      else { enterCurrentStep(); toast(`已跳过：${gone.itemName}`); render(); pushNative(); }
     });
 
-    if (isCont) {
-      const startedAt = Date.now();
-      const clock = root.querySelector('[data-cont-clock]');
-      const t = setInterval(() => {
-        if (!clock.isConnected) { clearInterval(t); return; }
-        clock.textContent = fmtClock(Date.now() - startedAt);
-      }, 500);
-    }
-
-    if (phase === 'set' || phase === 'continuous') pushNative();
+    renderTickerOnly();
   }
 
   function stageName(step) {
@@ -740,10 +792,9 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
 
   /** 结束但不保存：清掉进行中的会话，既不落库也不写日程 */
   function discardSession() {
-    if (ticker) clearInterval(ticker);
-    ticker = null;
-    settled = false;
+    if (destroyed) return;
     store.clearOngoing();
+    destroy();
     stopNotification();
     if (onDiscarded) onDiscarded(session);
   }
@@ -751,6 +802,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
   /* -------------------------------------------------- 推送给原生通知栏 */
 
   function pushNative() {
+    if (destroyed || readingNative || phase === 'done') return;
     const step = currentStep(session);
     if (!step && phase !== 'rest') return;
     const label = phase === 'rest'
@@ -759,6 +811,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
 
     const base = {
       sessionId: session.id,
+      stepId: step ? step.id : '',
       itemName: step ? step.itemName : '',
     };
 
@@ -773,7 +826,7 @@ export function createPlayer({ store, session, onExit, onFinish, onDiscarded }) 
         confirmDeadline: settings.confirmTimeoutMs > 0 ? confirmAt + settings.confirmTimeoutMs : 0 };
     } else if (phase === 'continuous') {
       payload = { ...base, phase: 'continuous', label: '',
-        anchorTs: Date.now(), restEndTs: 0, plannedRestMs: 0, confirmDeadline: 0 };
+        anchorTs: continuousStartedAt, restEndTs: 0, plannedRestMs: 0, confirmDeadline: 0 };
     } else {
       payload = { ...base, phase: 'set', label,
         anchorTs: Date.now(), restEndTs: 0, plannedRestMs: 0, confirmDeadline: 0 };

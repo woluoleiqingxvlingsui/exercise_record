@@ -44,7 +44,8 @@ import org.json.JSONObject;
  *     · 后台：JS 被冻结，本服务自己的 tick 发现到点，自己震动。
  *   alertRestDone() 用 lastAlertedRestEndTs 去重，保证一次休息只震一次。
  *
- * 不持 WakeLock：走字由系统绘制，服务只做事件驱动的发布/重发（与番茄钟同策略）。
+ * 不持 WakeLock，也不申请精确闹钟权限：系统可独立绘制通知倒计时，
+ * 但 Handler 在设备深睡时会暂停，到点震动和自动推进可能延后到 CPU 唤醒。
  * 状态写 SharedPreferences：被系统回收重建（START_STICKY 传回 null intent）时恢复。
  */
 public class RestTimerService extends Service {
@@ -55,7 +56,9 @@ public class RestTimerService extends Service {
     public static final String ACTION_STOP = "app.exercise.record.timer.STOP";
     public static final String EXTRA_STATE = "state";
 
-    private static final String CH_TIMER = "exercise-timer-v1";
+    // 新渠道避免已安装版本的 PUBLIC 渠道设置继续暴露训练内容。
+    private static final String CH_TIMER = "exercise-timer-v2";
+    private static final String CH_TIMER_PUBLIC_LEGACY = "exercise-timer-v1";
     /** 历史遗留渠道：1.x 版本用它发过「休息结束」通知，现在不再使用，顺手删掉 */
     private static final String CH_REST_DONE_LEGACY = "exercise-rest-done-v1";
     private static final int NOTIF_TIMER = 0x4521;
@@ -94,6 +97,8 @@ public class RestTimerService extends Service {
 
     @Override
     public int onStartCommand(Intent intent, int flags, int startId) {
+        String previousPhase = phase();
+        String previousSessionId = state.optString("sessionId", "");
         if (intent != null) {
             String action = intent.getAction();
             if (ACTION_STOP.equals(action)) {
@@ -104,7 +109,23 @@ public class RestTimerService extends Service {
             String raw = intent.getStringExtra(EXTRA_STATE);
             if (raw != null && !raw.trim().isEmpty()) {
                 try {
-                    state = new JSONObject(raw);
+                    JSONObject incoming = new JSONObject(raw);
+                    // 自动推进与桥更新可能同时到达；同一步的旧询问不能抹掉已生效的倒计时。
+                    boolean staleConfirm = state.optBoolean("autoApplied", false)
+                        && state.optString("sessionId").equals(incoming.optString("sessionId"))
+                        && !state.optString("stepId").isEmpty()
+                        && state.optString("stepId").equals(incoming.optString("stepId"))
+                        && "confirm".equals(incoming.optString("phase"));
+                    if (staleConfirm) incoming = state;
+                    if ("ready".equals(incoming.optString("phase"))) {
+                        // 桥上传入的镜像不含 readyAt；同一会话的 ready 更新不能重置退场时限。
+                        boolean sameReady = "ready".equals(previousPhase)
+                            && previousSessionId.equals(incoming.optString("sessionId", ""));
+                        incoming.put("readyAt", sameReady
+                            ? state.optLong("readyAt", System.currentTimeMillis())
+                            : System.currentTimeMillis());
+                    }
+                    state = incoming;
                     persist();
                 } catch (JSONException e) {
                     Log.w(TAG, "bad state payload, keeping previous", e);
@@ -145,6 +166,11 @@ public class RestTimerService extends Service {
             abortStart();
             return START_NOT_STICKY;
         }
+        // 阶段变化立即改用新节拍；同阶段刷新不推迟已排队的检查。
+        if (!previousPhase.equals(phase())
+                || !previousSessionId.equals(state.optString("sessionId", ""))) {
+            cancelTick();
+        }
         scheduleTick();
         return START_STICKY;
     }
@@ -175,7 +201,7 @@ public class RestTimerService extends Service {
                 }
             } else if ("ready".equals(phase)) {
                 long since = now - state.optLong("readyAt", now);
-                if (since > READY_IDLE_TIMEOUT_MS) {
+                if (since >= READY_IDLE_TIMEOUT_MS) {
                     Log.i(TAG, "ready idle timeout, shutting down");
                     shutdown();
                     return;
@@ -214,10 +240,7 @@ public class RestTimerService extends Service {
     private void autoApplyPlan() {
         try {
             long deadline = confirmDeadline();
-            long planned = plannedRestMs();
-            if (planned <= 0) {
-                planned = 90_000L;
-            }
+            long planned = Math.max(0, plannedRestMs());
             state.put("phase", "rest");
             state.put("anchorTs", 0);
             state.put("restEndTs", deadline + planned);
@@ -244,6 +267,9 @@ public class RestTimerService extends Service {
         } catch (JSONException e) {
             Log.w(TAG, "fireRestDone failed", e);
         }
+        // tick 到点与首次 ACTION_ALERT 都必须继续检查 ready 的闲置退场。
+        cancelTick();
+        scheduleTick();
     }
 
     /**
@@ -301,11 +327,23 @@ public class RestTimerService extends Service {
         String label = state.optString("label", "");
         String item = state.optString("itemName", "");
 
+        Notification publicVersion = new NotificationCompat.Builder(this, CH_TIMER)
+            .setSmallIcon(R.drawable.ic_stat_timer)
+            .setContentTitle(getString(R.string.app_name))
+            .setContentText("计时服务运行中，解锁后查看详情")
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setShowWhen(false)
+            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setContentIntent(contentIntent())
+            .build();
+
         NotificationCompat.Builder b = new NotificationCompat.Builder(this, CH_TIMER)
             .setSmallIcon(R.drawable.ic_stat_timer)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicVersion)
             .setContentIntent(contentIntent());
 
         if ("set".equals(phase)) {
@@ -376,10 +414,11 @@ public class RestTimerService extends Service {
             CH_TIMER, getString(R.string.timer_channel_name), NotificationManager.IMPORTANCE_DEFAULT);
         timer.setSound(null, null);
         timer.setShowBadge(false);
-        // 渠道级锁屏可见性：不显式设的话 HyperOS 可能按隐私内容处理，锁屏不给显示
-        timer.setLockscreenVisibility(Notification.VISIBILITY_PUBLIC);
+        // 锁屏默认使用不含动作、组数和计时值的 publicVersion；用户可自行更改系统设置。
+        timer.setLockscreenVisibility(Notification.VISIBILITY_PRIVATE);
         nm.createNotificationChannel(timer);
 
+        nm.deleteNotificationChannel(CH_TIMER_PUBLIC_LEGACY);
         // 老版本建过「休息结束」渠道并一直在通知设置里留着，这里主动清掉
         nm.deleteNotificationChannel(CH_REST_DONE_LEGACY);
     }

@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>应用数据切换安全测试</title><link rel="stylesheet" href="../../www/css/app.css"></head>
+<body><div id="app"><div class="topbar"><div class="title">训练记录</div><button id="btn-settings">设置</button></div><div id="screen" class="screen"></div><div id="tabbar" class="tabbar"><button data-tab="plans">计划</button><button data-tab="train">训练</button><button data-tab="calendar">日历</button><button data-tab="stats">统计</button></div></div><pre id="out">PENDING</pre>
+<script type="module">
+import { memoryBackend, getStore } from '../../www/js/store.js';
+import { sessionFromPlan } from '../../www/js/model.js';
+import { renderPlans } from '../../www/js/views/plans.js';
+import { closeSheet } from '../../www/js/ui.js';
+const results = [], errors = [];
+window.addEventListener('error', e => errors.push(e.message));
+window.addEventListener('unhandledrejection', e => errors.push(String(e.reason)));
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const assert = (ok, message) => { if (!ok) throw new Error(message); };
+const click = el => { assert(el, '缺少按钮'); el.click(); };
+const sheet = selector => document.querySelector('.sheet ' + selector);
+const screen = document.getElementById('screen');
+Object.defineProperty(window, 'localStorage', { value: memoryBackend(), configurable: true });
+await import('../../www/js/main.js');
+const store = getStore();
+async function check(name, run) {
+  try { await run(); results.push('PASS  ' + name); }
+  catch (e) { results.push('FAIL  ' + name + ' :: ' + e.message); }
+  finally { closeSheet(); }
+}
+const tab = name => click(document.querySelector(`[data-tab="${name}"]`));
+const start = () => { tab('plans'); click(screen.querySelector('[data-start]')); };
+await check('逐组编辑删除第一组会保留后面两组的不同次数', async () => {
+  const plan = { id: 'delete-test', name: '删除测试', category: '力量', stages: [{ id: 's', kind: 'main', items: [{ id: 'i', name: '深蹲', mode: 'reps', sets: [{ reps: 8 }, { reps: 7 }, { reps: 6 }] }] }] };
+  store.savePlan(plan);
+  renderPlans(screen, { store, onStart() {} });
+  click(screen.querySelector('[data-plan="delete-test"] [data-edit]'));
+  click(sheet('[data-del-set="0.0.0"]')); click(sheet('[data-save]'));
+  assert(JSON.stringify(store.getPlan(plan.id).stages[0].items[0].sets.map(s => s.reps)) === '[7,6]', '删除了错误的组');
+  store.deletePlan(plan.id);
+});
+await check('存在待恢复训练时开始其他计划不会覆盖它', async () => {
+  const old = sessionFromPlan(store.listPlans()[0]);
+  store.saveOngoing(old);
+  start();
+  assert(store.getOngoing().id === old.id, '旧训练被覆盖');
+  assert(sheet('[data-resume]'), '没有提供恢复入口');
+  closeSheet(); store.clearOngoing();
+});
+await check('清空数据会停止活动播放器，旧训练不能重新写回', async () => {
+  start();
+  click(document.getElementById('btn-settings')); click(sheet('[data-wipe]')); click(sheet('[data-ok]'));
+  await sleep(40);
+  assert(store.getOngoing() === null && store.listPlans().length === 0, '清空失败');
+  tab('train');
+  assert(!screen.querySelector('[data-done]'), '旧播放器仍存在');
+  await sleep(300);
+  assert(store.getOngoing() === null && store.allSessions().length === 0, '清空后旧数据复活');
+});
+await check('全量替换后使用导入训练并保护它免于新计划覆盖', async () => {
+  const plan = { id: 'new-plan', name: '新训练模板', category: '力量', stages: [{ id: 's', kind: 'main', items: [{ id: 'i', name: '新动作', mode: 'reps', defaultRestMs: 45000, sets: { repeat: 2, of: { reps: 8 } } }] }] };
+  store.savePlan(plan); start();
+  const oldId = store.getOngoing().id;
+  const replacement = sessionFromPlan(plan); replacement.id = 'imported-ongoing';
+  const payload = store.exportAll(); payload.data.ongoing = replacement;
+  click(document.getElementById('btn-settings')); click(sheet('[data-import]'));
+  sheet('[data-in]').value = JSON.stringify(payload); click(sheet('[data-mode-replace]')); click(sheet('[data-do]'));
+  assert(store.getOngoing().id === replacement.id && sheet('[data-resume]'), '替换后未提供导入训练恢复入口');
+  closeSheet(); tab('train');
+  assert(!screen.querySelector('[data-done]'), '替换后仍显示旧播放器');
+  start();
+  assert(store.getOngoing().id === replacement.id && store.getOngoing().id !== oldId, '新开始覆盖了导入训练');
+  click(sheet('[data-resume]'));
+  assert(screen.textContent.includes('新动作'), '无法恢复导入训练');
+  click(document.getElementById('btn-settings')); click(sheet('[data-wipe]')); click(sheet('[data-ok]'));
+  await sleep(40);
+});
+await check('存储写入失败会显示常驻警告', async () => {
+  const backend = window.localStorage;
+  const original = backend.setItem;
+  backend.setItem = () => { throw new Error('QuotaExceededError'); };
+  try { store.savePlan({ id: 'not-saved' }); } catch (_) { }
+  backend.setItem = original;
+  const warning = document.querySelector('.storage-warning');
+  assert(!warning.hidden && warning.textContent.includes('尚未保存'), '用户看不到保存失败警告');
+});
+document.getElementById('out').textContent = JSON.stringify({ total: results.length, failed: results.filter(x => x.startsWith('FAIL')).length, errors, results }, null, 1);
+</script></body></html>

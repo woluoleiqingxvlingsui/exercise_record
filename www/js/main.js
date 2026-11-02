@@ -16,6 +16,20 @@ import { stopNotification, isNative, consumeOpenTrain } from './native.js';
 /* ------------------------------------------------------------------ 启动 */
 
 const store = initBrowserStore();
+const storageWarning = document.createElement('div');
+storageWarning.className = 'storage-warning';
+storageWarning.setAttribute('role', 'alert');
+document.querySelector('.topbar').after(storageWarning);
+store.onStatus(({ warning }) => {
+  storageWarning.textContent = warning;
+  storageWarning.hidden = !warning;
+});
+
+function reportStorageError(error) {
+  if (error && error.name === 'QuotaError') toast(error.message, 6000);
+}
+window.addEventListener('error', (event) => reportStorageError(event.error));
+window.addEventListener('unhandledrejection', (event) => reportStorageError(event.reason));
 
 // 只在「第一次装 App」时铺示例：用 meta.seeded 标记，
 // 否则用户把示例删光后下次启动又会冒出来，很烦人。
@@ -135,6 +149,12 @@ function renderTrainTab() {
 
 function startPlan(plan) {
   if (app.player) { toast('先结束当前这次训练'); return; }
+  const ongoing = store.getOngoing();
+  if (ongoing) {
+    switchTab('train');
+    promptResume(ongoing);
+    return;
+  }
   const session = sessionFromPlan(plan);
   store.saveOngoing(session);
   mountPlayer(session);
@@ -367,9 +387,20 @@ function openSettings() {
               try {
                 const payload = JSON.parse($3('[data-in]').value);
                 const summary = store.importAll(payload, { mode });
+                if (mode === 'replace') {
+                  dropPlayer();
+                  app.session = null;
+                  stopNotification();
+                }
                 closeSheet();
                 toast(`导入完成：计划 ${summary.plans} · 记录 ${summary.sessions} · 日程 ${summary.days} 天`);
-                renderTab();
+                if (mode === 'replace') {
+                  const ongoing = store.getOngoing();
+                  switchTab(ongoing ? 'train' : 'plans');
+                  if (ongoing) promptResume(ongoing);
+                } else {
+                  renderTab();
+                }
               } catch (e) {
                 toast(`导入失败：${e.message}`);
               }
@@ -380,12 +411,19 @@ function openSettings() {
 
       $('[data-wipe]').addEventListener('click', async () => {
         if (!(await confirmSheet({ title: '清空全部数据', message: '计划、记录、日程全部删除，无法恢复！建议先导出备份。', okText: '确认清空', danger: true }))) return;
-        store.wipeAll();
-        // seeded 保持 true：清空是用户主动要的，别让示例计划下次启动又长回来
-        store.saveMeta({ ...store.getMeta(), schemaVersion: SCHEMA_VERSION, seeded: true });
-        closeSheet();
-        toast('已清空');
-        switchTab('plans');
+        dropPlayer();
+        app.session = null;
+        stopNotification();
+        try {
+          store.wipeAll();
+          store.saveMeta({ ...store.getMeta(), schemaVersion: SCHEMA_VERSION, seeded: true });
+          closeSheet();
+          toast('已清空');
+          switchTab('plans');
+        } catch (e) {
+          toast(`清空失败：${e.message}`, 6000);
+          switchTab('train');
+        }
       });
     },
   });

@@ -10,10 +10,12 @@
  *  4. **配额保护**：写失败抛 QuotaError，由界面提示导出备份，绝不静默丢数据。
  */
 
-import { monthKeyOf, deepClone, uid } from './util.js';
+import { monthKeyOf, uid } from './util.js';
 
 export const SCHEMA_VERSION = 1;
 export const EXPORT_FORMAT = 'exercise-record';
+
+const JOURNAL_KEY = 'ex.import-undo';
 
 const K = {
   meta: 'ex.meta',
@@ -69,10 +71,68 @@ export const DEFAULT_SETTINGS = {
   schemaVersion: SCHEMA_VERSION,
 };
 
-export function createStore(backend) {
+export function createStore(backend, options = {}) {
+  const listeners = new Set();
+  let status = { mode: options.mode || 'persistent', writable: true, warning: options.warning || '' };
+  let recovery = null;
+  const publish = (patch) => {
+    status = { ...status, ...patch };
+    listeners.forEach((fn) => { try { fn({ ...status }); } catch (_) { /* UI observer */ } });
+  };
+  const getStorageStatus = () => ({ ...status });
+  const onStatus = (fn) => {
+    listeners.add(fn);
+    fn(getStorageStatus());
+    return () => listeners.delete(fn);
+  };
+  const dataKey = (key) => Object.values(K).includes(key) || key.startsWith(K.sessionPrefix);
+  const rawKeys = () => {
+    const keys = new Set([K.meta, K.plans, K.schedule, K.settings, K.ongoing]);
+    if (typeof backend.key === 'function') {
+      for (let i = 0; i < backend.length; i += 1) {
+        const key = backend.key(i);
+        if (key && dataKey(key)) keys.add(key);
+      }
+    }
+    // Also support injected backends without key enumeration.
+    try {
+      const meta = JSON.parse(backend.getItem(K.meta) || 'null');
+      if (Array.isArray(meta?.months)) meta.months.forEach((m) => keys.add(K.sessionPrefix + m));
+    } catch (_) { /* Enumerated buckets remain recoverable even with damaged meta. */ }
+    return [...keys];
+  };
+  const recover = () => {
+    try {
+      // Free imported data before restoring; the undo log stays durable until all writes succeed.
+      rawKeys().forEach((key) => backend.removeItem(key));
+      recovery.forEach(([key, value]) => backend.setItem(key, value));
+      backend.removeItem(JOURNAL_KEY);
+      recovery = null;
+    } catch (_) {
+      publish({ writable: false, warning: '导入恢复尚未完成，当前只读显示原数据；请先导出备份，再释放空间并重启。' });
+    }
+  };
+  const savedUndo = backend.getItem(JOURNAL_KEY);
+  if (savedUndo != null) {
+    let journal;
+    try { journal = JSON.parse(savedUndo); } catch (_) { /* Preserve damaged recovery data. */ }
+    if (!Array.isArray(journal) || !journal.every((pair) => Array.isArray(pair) && pair.length === 2
+      && typeof pair[0] === 'string' && dataKey(pair[0]) && typeof pair[1] === 'string')) {
+      publish({ writable: false, warning: '本地导入恢复日志损坏，已停止写入；当前数据可能不完整，请保留原存储并导出可读数据，再使用完整备份恢复。' });
+    } else {
+      recovery = journal;
+      recover();
+    }
+  }
+  const visibleKeys = () => recovery ? recovery.map(([key]) => key) : rawKeys();
+  const readRaw = (key) => recovery
+    ? (recovery.find(([k]) => k === key)?.[1] ?? null) : backend.getItem(key);
+  const assertWritable = () => {
+    if (!status.writable) throw new QuotaError(status.warning);
+  };
   const readJson = (key, fallback) => {
     try {
-      const raw = backend.getItem(key);
+      const raw = readRaw(key);
       if (raw == null || raw === '') return fallback;
       return JSON.parse(raw);
     } catch (e) {
@@ -81,14 +141,22 @@ export function createStore(backend) {
   };
 
   const writeJson = (key, value) => {
+    assertWritable();
     try {
       backend.setItem(key, JSON.stringify(value));
     } catch (e) {
-      throw new QuotaError('本地存储写入失败（可能空间已满），请尽快在设置里导出备份', e);
+      publish({ warning: '本地存储写入失败，本次改动尚未保存；请尽快导出备份并释放空间。' });
+      throw new QuotaError(status.warning, e);
     }
   };
 
-  const remove = (key) => { try { backend.removeItem(key); } catch (e) { /* ignore */ } };
+  const remove = (key) => {
+    assertWritable();
+    try { backend.removeItem(key); } catch (e) {
+      publish({ warning: '本地存储删除失败，数据尚未清除，请备份后重试。' });
+      throw new QuotaError(status.warning, e);
+    }
+  };
 
   /* ---------------------------------------------------------------- meta */
 
@@ -123,15 +191,9 @@ export function createStore(backend) {
    */
   function listMonths() {
     const months = new Set(getMeta().months);
-    if (typeof backend.length === 'number' && typeof backend.key === 'function') {
-      for (let i = 0; i < backend.length; i += 1) {
-        const k = backend.key(i);
-        if (k && k.startsWith(K.sessionPrefix)) {
-          const m = k.slice(K.sessionPrefix.length);
-          if (m) months.add(m);
-        }
-      }
-    }
+    visibleKeys().forEach((key) => {
+      if (key.startsWith(K.sessionPrefix)) months.add(key.slice(K.sessionPrefix.length));
+    });
     return Array.from(months).sort();
   }
 
@@ -325,32 +387,34 @@ export function createStore(backend) {
     };
   }
 
-  /** 当前全部数据的快照（全量替换导入失败时用来回滚） */
-  function snapshotAll() {
-    const sessions = {};
-    listMonths().forEach((m) => { sessions[m] = sessionsInMonth(m); });
-    return {
-      plans: readJson(K.plans, []),
-      schedule: getSchedule(),
-      settings: readJson(K.settings, {}),
-      meta: getMeta(),
-      ongoing: readJson(K.ongoing, null),
-      sessions,
-    };
-  }
-
-  function restoreAll(snap) {
-    // 逐项写回，某一项失败不能连累其它项。
-    // 写失败恰好说明该项**没被覆盖**（原值还在盘上），那正好不用管。
-    const tryWrite = (key, value) => {
-      try { writeJson(key, value); } catch (_) { /* 忽略这一项 */ }
-    };
-    tryWrite(K.plans, snap.plans);
-    tryWrite(K.schedule, snap.schedule);
-    tryWrite(K.settings, snap.settings);
-    tryWrite(K.meta, snap.meta);
-    if (snap.ongoing) tryWrite(K.ongoing, snap.ongoing); else remove(K.ongoing);
-    Object.keys(snap.sessions || {}).forEach((m) => tryWrite(K.sessionPrefix + m, snap.sessions[m]));
+  /** localStorage has no multi-key transaction: reserve a durable undo log BEFORE touching data.
+   * If rollback itself fails, all reads use the old log and writes are blocked until restart recovery.
+   * Requires space for old + new + undo at peak; insufficient space rejects without deleting old data.
+   * This protects a single writer; concurrent tabs/imports are not a supported transaction boundary.
+   */
+  function replaceAll(data, opts) {
+    assertWritable();
+    const stagingBackend = memoryBackend();
+    const staging = createStore(stagingBackend);
+    const summary = staging.importAll({ format: EXPORT_FORMAT, version: SCHEMA_VERSION, data }, { ...opts, mode: 'merge' });
+    const previous = rawKeys().map((key) => [key, backend.getItem(key)]).filter(([, value]) => value != null);
+    writeJson(JOURNAL_KEY, previous);
+    recovery = previous;
+    try {
+      const nextKeys = [];
+      for (let i = 0; i < stagingBackend.length; i += 1) nextKeys.push(stagingBackend.key(i));
+      // Write even empty values, so write failures are observable instead of silently skipping keys.
+      nextKeys.forEach((key) => backend.setItem(key, stagingBackend.getItem(key)));
+      rawKeys().filter((key) => !nextKeys.includes(key)).forEach((key) => backend.removeItem(key));
+      backend.removeItem(JOURNAL_KEY); // Commit point: all new data is durable before discarding undo.
+      recovery = null;
+      publish({ writable: true, warning: options.warning || '' });
+      return { ...summary, mode: 'replace' };
+    } catch (e) {
+      recover();
+      if (!recovery) publish({ warning: '导入未完成，原数据已恢复。请导出备份并释放空间后重试。' });
+      throw new QuotaError(status.warning, e);
+    }
   }
 
   /**
@@ -362,44 +426,171 @@ export function createStore(backend) {
    */
   function validatePayload(data) {
     const problems = [];
-    if (data.plans != null && !Array.isArray(data.plans)) problems.push('data.plans 不是数组');
-    if (data.schedule != null && (typeof data.schedule !== 'object' || Array.isArray(data.schedule))) {
-      problems.push('data.schedule 不是对象');
-    }
-    if (data.settings != null && (typeof data.settings !== 'object' || Array.isArray(data.settings))) {
-      problems.push('data.settings 不是对象');
-    }
-    if (data.sessions != null) {
-      if (typeof data.sessions !== 'object' || Array.isArray(data.sessions)) {
-        problems.push('data.sessions 不是对象');
-      } else {
-        Object.keys(data.sessions).forEach((m) => {
-          if (!Array.isArray(data.sessions[m])) problems.push(`data.sessions.${m} 不是数组`);
+    const fail = (path) => { if (problems.length < 20) problems.push(`${path} 无效`); };
+    const object = (v, path) => {
+      const ok = v !== null && typeof v === 'object' && !Array.isArray(v);
+      if (!ok) fail(path);
+      return ok;
+    };
+    const array = (v, path, check) => {
+      if (!Array.isArray(v)) { fail(path); return; }
+      v.forEach((x, i) => check(x, `${path}[${i}]`));
+    };
+    const text = (v, path) => { if (typeof v !== 'string') fail(path); };
+    const id = (v, path) => { if (typeof v !== 'string' || !v.trim()) fail(path); };
+    const number = (v, path) => { if (typeof v !== 'number' || !Number.isFinite(v) || v < 0) fail(path); };
+    const integer = (v, path) => { number(v, path); if (!Number.isSafeInteger(v)) fail(path); };
+    const optional = (v, fields, check, path) => fields.forEach((key) => {
+      if (v[key] != null) check(v[key], `${path}.${key}`);
+    });
+    const strings = (v, path) => array(v, path, text);
+    const monthOK = (v) => typeof v === 'string' && /^\d{4}-(0[1-9]|1[0-2])$/.test(v);
+    const dateOK = (v) => {
+      if (typeof v !== 'string' || !/^\d{4}-\d{2}-\d{2}$/.test(v)) return false;
+      const d = new Date(`${v}T12:00:00Z`);
+      return Number.isFinite(d.getTime()) && d.toISOString().slice(0, 10) === v;
+    };
+    const date = (v, path) => { if (!dateOK(v)) fail(path); };
+    const spec = (v, path) => {
+      if (!object(v, path)) return;
+      optional(v, ['reps', 'weightKg', 'durationS', 'distanceKm', 'paceSPerKm'], number, path);
+      optional(v, ['note'], text, path);
+    };
+    const plan = (v, path, requireId = false) => {
+      if (!object(v, path)) return;
+      if (requireId) id(v.id, `${path}.id`);
+      optional(v, ['id', 'name', 'category', 'note'], text, path);
+      if (v.tags != null) strings(v.tags, `${path}.tags`);
+      if (v.stages != null) array(v.stages, `${path}.stages`, (stage, sp) => {
+        if (!object(stage, sp)) return;
+        optional(stage, ['id', 'kind', 'name'], text, sp);
+        if (stage.items != null) array(stage.items, `${sp}.items`, (item, ip) => {
+          if (!object(item, ip)) return;
+          optional(item, ['id', 'name'], text, ip);
+          if (item.mode != null && !['reps', 'duration', 'distance'].includes(item.mode)) fail(`${ip}.mode`);
+          optional(item, ['defaultRestMs'], number, ip);
+          if (item.sets != null) {
+            if (Array.isArray(item.sets)) array(item.sets, `${ip}.sets`, spec);
+            else if (object(item.sets, `${ip}.sets`)) {
+              if (item.sets.repeat != null) {
+                integer(item.sets.repeat, `${ip}.sets.repeat`);
+                if (item.sets.repeat < 1 || item.sets.repeat > 10000) fail(`${ip}.sets.repeat`);
+              }
+              if (item.sets.of != null) spec(item.sets.of, `${ip}.sets.of`);
+            }
+          }
         });
+      });
+    };
+    const session = (v, path, month = null, ongoing = false) => {
+      if (!object(v, path)) return;
+      id(v.id, `${path}.id`);
+      date(v.dateKey, `${path}.dateKey`);
+      if (month && monthKeyOf(v.dateKey) !== month) fail(`${path}.dateKey 与分桶不一致`);
+      optional(v, ['planId', 'planName', 'status', 'source', 'uiPhase'], text, path);
+      optional(v, ['startedAt', 'endedAt', 'loggedSec'], number, path);
+      if (v.planSnapshot != null) plan(v.planSnapshot, `${path}.planSnapshot`);
+      if (ongoing && (!Array.isArray(v.timeline) || !Array.isArray(v.entries)
+        || !Array.isArray(v.adjustments) || (v.timeline.length > 0 && !v.planSnapshot))) {
+        fail(`${path} 缺少恢复训练所需字段`);
       }
+      if (v.cursor != null) {
+        integer(v.cursor, `${path}.cursor`);
+        if (Array.isArray(v.timeline) && v.cursor > v.timeline.length) fail(`${path}.cursor`);
+      }
+      if (v.timeline != null) array(v.timeline, `${path}.timeline`, (step, tp) => {
+        if (!object(step, tp)) return;
+        id(step.id, `${tp}.id`);
+        optional(step, ['itemId', 'itemName', 'stageName', 'stageKind'], text, tp);
+        optional(step, ['stageIndex', 'itemIndex', 'setIndex', 'setTotal'], integer, tp);
+        optional(step, ['restPlannedMs', 'restOverrideMs'], number, tp);
+        if (step.continuous != null && typeof step.continuous !== 'boolean') fail(`${tp}.continuous`);
+        if (step.mode != null && !['reps', 'duration', 'distance'].includes(step.mode)) fail(`${tp}.mode`);
+        if (step.spec != null) spec(step.spec, `${tp}.spec`);
+      });
+      if (v.entries != null) array(v.entries, `${path}.entries`, (entry, ep) => {
+        if (!object(entry, ep)) return;
+        optional(entry, ['itemName', 'stepId', 'stageKind', 'decision'], text, ep);
+        optional(entry, ['restActualMs', 'restPlannedMs', 'completedAt'], number, ep);
+        optional(entry, ['setIndex', 'setTotal'], integer, ep);
+        if (entry.actual != null) spec(entry.actual, `${ep}.actual`);
+        if (entry.planned != null) spec(entry.planned, `${ep}.planned`);
+      });
+      if (v.adjustments != null) array(v.adjustments, `${path}.adjustments`, (a, ap) => {
+        if (!object(a, ap)) return;
+        optional(a, ['scope', 'field', 'reason', 'itemId', 'stepId'], text, ap);
+        optional(a, ['at'], number, ap);
+        ['from', 'to'].forEach((key) => {
+          if (a[key] != null && !['string', 'number'].includes(typeof a[key])) fail(`${ap}.${key}`);
+        });
+      });
+      if (v.playerState != null && object(v.playerState, `${path}.playerState`)) {
+        optional(v.playerState, ['restEndTs', 'restTotalMs', 'confirmAt', 'continuousStartedAt'], number, `${path}.playerState`);
+        optional(v.playerState, ['continuousStepId'], text, `${path}.playerState`);
+      }
+      if (v.feedback != null && object(v.feedback, `${path}.feedback`)) {
+        const fb = v.feedback;
+        optional(fb, ['rpe', 'at'], number, `${path}.feedback`);
+        optional(fb, ['note', 'nextTimeNote', 'completion'], text, `${path}.feedback`);
+        if (fb.feel != null) strings(fb.feel, `${path}.feedback.feel`);
+        if (fb.pain != null && object(fb.pain, `${path}.feedback.pain`)) {
+          if (fb.pain.parts != null) strings(fb.pain.parts, `${path}.feedback.pain.parts`);
+          optional(fb.pain, ['note'], text, `${path}.feedback.pain`);
+        }
+      }
+    };
+    if (!object(data, 'data')) return problems;
+    // Prevent prototype keys reaching ordinary object maps used by schedule/import consumers.
+    const safeKeys = (v, path) => {
+      if (!v || typeof v !== 'object') return;
+      Object.keys(v).forEach((key) => {
+        if (['__proto__', 'constructor', 'prototype'].includes(key)) fail(`${path}.${key}`);
+        safeKeys(v[key], `${path}.${key}`);
+      });
+    };
+    safeKeys(data, 'data');
+    if (data.plans != null) array(data.plans, 'data.plans', (p, path) => plan(p, path, true));
+    if (data.sessions != null && object(data.sessions, 'data.sessions')) {
+      const seen = new Set();
+      Object.entries(data.sessions).forEach(([month, list]) => {
+        if (!monthOK(month)) fail(`data.sessions.${month}`);
+        array(list, `data.sessions.${month}`, (s, path) => {
+          session(s, path, month);
+          if (s && seen.has(s.id)) fail(`${path}.id 重复`);
+          if (s) seen.add(s.id);
+        });
+      });
     }
-    if (data.meta != null && (typeof data.meta !== 'object' || Array.isArray(data.meta))) {
-      problems.push('data.meta 不是对象');
+    if (data.ongoing != null) session(data.ongoing, 'data.ongoing', null, true);
+    if (data.schedule != null && object(data.schedule, 'data.schedule')) Object.entries(data.schedule).forEach(([day, v]) => {
+      if (!dateOK(day)) fail(`data.schedule.${day}`);
+      const path = `data.schedule.${day}`;
+      if (!object(v, path)) return;
+      if (v.dateKey != null && v.dateKey !== day) fail(`${path}.dateKey`);
+      optional(v, ['note', 'status'], text, path);
+      if (v.sessions != null) strings(v.sessions, `${path}.sessions`);
+      if (v.planned != null) array(v.planned, `${path}.planned`, (p, pp) => {
+        if (!object(p, pp)) return;
+        id(p.id, `${pp}.id`);
+        optional(p, ['planId', 'planName'], text, pp);
+      });
+    });
+    if (data.settings != null && object(data.settings, 'data.settings')) {
+      optional(data.settings, ['confirmTimeoutMs', 'defaultRestMs', 'schemaVersion'], number, 'data.settings');
+      ['knownCategories', 'hiddenCategories'].forEach((key) => {
+        if (data.settings[key] != null) strings(data.settings[key], `data.settings.${key}`);
+      });
+      if (data.settings.vibrateOnRestEnd != null && typeof data.settings.vibrateOnRestEnd !== 'boolean') fail('data.settings.vibrateOnRestEnd');
     }
-    if (data.ongoing != null && (typeof data.ongoing !== 'object' || Array.isArray(data.ongoing))) {
-      problems.push('data.ongoing 不是对象');
+    if (data.meta != null && object(data.meta, 'data.meta') && data.meta.months != null) {
+      array(data.meta.months, 'data.meta.months', (m, path) => { if (!monthOK(m)) fail(path); });
     }
     return problems;
   }
 
   function wipeAll() {
-    remove(K.plans); remove(K.schedule); remove(K.settings);
-    remove(K.ongoing); remove(K.meta);
-    listMonths().forEach((m) => remove(K.sessionPrefix + m));
-    // 兜底：后端支持枚举就全清（防止 meta 丢失导致月份桶变孤儿）
-    if (typeof backend.length === 'number' && typeof backend.key === 'function') {
-      const keys = [];
-      for (let i = 0; i < backend.length; i += 1) {
-        const k = backend.key(i);
-        if (k && k.startsWith('ex.')) keys.push(k);
-      }
-      keys.forEach(remove);
-    }
+    assertWritable();
+    visibleKeys().forEach(remove);
   }
 
   /**
@@ -414,8 +605,13 @@ export function createStore(backend) {
     if (Number(payload.version) > SCHEMA_VERSION) {
       throw new Error(`备份来自更新的版本（v${payload.version}），请先升级 App`);
     }
-    const data = payload.data || {};
+    assertWritable();
+    if (!Number.isSafeInteger(payload.version) || payload.version < 1) {
+      throw new Error('备份版本无效');
+    }
+    const data = payload.data;
     const mode = opts.mode || 'merge';
+    if (!['merge', 'replace'].includes(mode)) throw new Error('导入模式无效');
     const overwrite = !!opts.overwrite;
     const summary = { plans: 0, sessions: 0, days: 0, ongoing: 0, mode };
 
@@ -426,11 +622,9 @@ export function createStore(backend) {
       throw new Error('备份文件结构不正确：' + problems.join('；'));
     }
 
-    // 全量替换：先拍快照，写入过程中任何一步失败都回滚，绝不留下"清了一半"的库
-    const snap = mode === 'replace' ? snapshotAll() : null;
-    if (mode === 'replace') wipeAll();
+    if (mode === 'replace') return replaceAll(data, opts);
 
-    try {
+    {
       // 计划
       const plans = listPlans();
       (data.plans || []).forEach((p) => {
@@ -501,12 +695,6 @@ export function createStore(backend) {
         summary.days += 1;
       });
       saveSchedule(sched);
-    } catch (e) {
-      // 替换模式写失败 → 把原库原样还回去
-      if (snap) {
-        try { restoreAll(snap); } catch (_) { /* 回滚也失败就只剩原错误了 */ }
-      }
-      throw e;
     }
 
     return summary;
@@ -516,19 +704,15 @@ export function createStore(backend) {
   function usage() {
     let bytes = 0;
     const keys = [];
-    if (typeof backend.length === 'number' && typeof backend.key === 'function') {
-      for (let i = 0; i < backend.length; i += 1) {
-        const k = backend.key(i);
-        if (k && k.startsWith('ex.')) {
-          keys.push(k);
-          bytes += (backend.getItem(k) || '').length;
-        }
-      }
-    }
+    visibleKeys().forEach((key) => {
+      const value = readRaw(key);
+      if (value != null) { keys.push(key); bytes += value.length; }
+    });
     return { keys: keys.length, bytes, sessions: allSessions().length, plans: listPlans().length };
   }
 
   return {
+    getStorageStatus, onStatus,
     // meta
     getMeta, saveMeta, listMonths,
     // settings
@@ -566,17 +750,20 @@ export function getStore() {
   return _store;
 }
 
-/** 浏览器环境：优先 localStorage；不可用（隐私模式等）退化到内存，功能不炸只是不持久 */
+/** 空间不足仍保留可读的持久库；只有无法读取存储时才使用临时内存。 */
 export function initBrowserStore() {
   let backend;
   try {
-    const probe = '__ex_probe__';
-    window.localStorage.setItem(probe, '1');
-    window.localStorage.removeItem(probe);
     backend = window.localStorage;
+    backend.getItem(K.meta);
+    void backend.length;
   } catch (e) {
-    console.warn('[store] localStorage 不可用，退化为内存存储（本次数据不会保留）', e);
-    backend = memoryBackend();
+    console.warn('[store] localStorage 不可用，退化为内存存储', e);
+    _store = createStore(memoryBackend(), {
+      mode: 'memory', warning: '当前无法使用本地存储，数据仅临时保留，关闭后会丢失；请及时导出备份。',
+    });
+    return _store;
   }
-  return initStore(backend);
+  _store = createStore(backend);
+  return _store;
 }

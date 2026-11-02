@@ -7,7 +7,8 @@
 
 param(
   [string]$Apk,
-  [string]$Serial
+  [string]$Serial,
+  [ValidateSet('debug', 'release')][string]$Flavor = 'debug'
 )
 
 $ErrorActionPreference = 'Stop'
@@ -64,7 +65,7 @@ Write-Step 'Pick APK'
 
 # 选包规则（要确定，不能靠 mtime 猜）：
 #   1. 优先 _out\apk —— 那是 build-apk.ps1 拷出来的、文件名带版本号的成品
-#   2. 同一批里取版本号最高的；同版本同时有 debug 和 release 时取 release
+#   2. 只选 -Flavor 指定的包型（默认 debug），再取版本号最高的包
 #   3. 排除 *-unsigned*.apk 与 androidTest 下的包（都不是能装的成品）
 # 原来是把两个目录的包混在一起按 mtime 排序取最新：会选中 debug 包、
 # 未签名包，甚至 androidTest 的包，而且不告诉你装的是哪一种。
@@ -107,15 +108,15 @@ if ($Apk) {
   $chosenSource = '手动指定 (-Apk)'
 } else {
   $outDir = Join-Path $RepoRoot '_out\apk'
-  $cands = Get-UsableApk $outDir
+  $cands = @(Get-UsableApk $outDir | Where-Object { (Get-ApkFlavor $_) -eq $Flavor })
   $chosenSource = '_out\apk'
   if (-not $cands.Count) {
     # _out\apk 里没有可用的（没打过包、或全被排除）才去看 gradle 原始产物
     $gradleOut = Join-Path $AppRoot 'android\app\build\outputs\apk'
-    $cands = Get-UsableApk $gradleOut
+    $cands = @(Get-UsableApk $gradleOut | Where-Object { (Get-ApkFlavor $_) -eq $Flavor })
     $chosenSource = 'android\app\build\outputs\apk'
   }
-  if (-not $cands.Count) { throw '没有找到 APK，先跑 build-apk.ps1。' }
+  if (-not $cands.Count) { throw "没有找到 $Flavor APK；请先构建此包型，或用 -Flavor release / -Apk 指定。不会自动切换签名。" }
 
   $scored = @($cands | ForEach-Object {
     $v = Get-ApkVersion $_
@@ -161,7 +162,7 @@ if ($code -eq 0 -and $out -match 'Success') {
   Write-Host $out -ForegroundColor Red
   if ($out -match 'INSTALL_FAILED_UPDATE_INCOMPATIBLE') {
     Write-Warn2 '签名不一致：debug 与 release 包不能互相覆盖。'
-    Write-Warn2 "解法一：$apkPath 若是 release，改用 debug 包；若是 debug，装一次 release 后卸载重装（会丢记录）。"
+    Write-Warn2 '请使用与手机现有应用相同的包型及原签名密钥；如确定更换签名，先导出备份，再手动卸载重装（卸载会丢记录）。'
   }
   throw 'adb install 失败'
 }

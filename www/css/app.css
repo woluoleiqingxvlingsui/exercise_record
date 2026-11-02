@@ -352,6 +352,16 @@ h1, h2, h3, h4 { margin: 0; font-weight: 800; letter-spacing: .2px; }
 }
 .topbar .title { font-size: var(--fs-xl); font-weight: 800; flex: 1; }
 
+.storage-warning {
+  margin: 0 var(--sp-4) var(--sp-3);
+  padding: var(--sp-3);
+  border: var(--stroke) solid var(--danger-dk);
+  border-radius: var(--r-btn);
+  background: var(--surface);
+  color: var(--danger-dk);
+  font-size: var(--fs-sm);
+}
+
 .screen {
   flex: 1;
   /* 键盘弹出时由 JS 把键盘高度写进 --kb，给内容留出滚动空间，

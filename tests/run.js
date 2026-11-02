@@ -12,3 +12,4 @@ import './store.test.js';
 import './seed.test.js';
 import './imports.test.js';
 import './regress.test.js';
+import './store-safety.test.js';

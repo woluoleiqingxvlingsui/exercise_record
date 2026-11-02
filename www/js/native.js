@@ -33,6 +33,7 @@ export async function syncNotification(state) {
   try {
     return await p.update({
       sessionId: String(state.sessionId || ''),
+      stepId: String(state.stepId || ''),
       phase: String(state.phase || ''),
       itemName: String(state.itemName || ''),
       label: String(state.label || ''),
@@ -102,8 +103,9 @@ export async function notifyRestDone(state) {
   const p = timerPlugin();
   if (!p || typeof p.restDone !== 'function') return { ok: false, reason: 'no-native' };
   try {
-    await p.restDone({
+    return await p.restDone({
       sessionId: String(state.sessionId || ''),
+      stepId: String(state.stepId || ''),
       phase: String(state.phase || 'rest'),
       itemName: String(state.itemName || ''),
       label: String(state.label || ''),
@@ -112,7 +114,6 @@ export async function notifyRestDone(state) {
       plannedRestMs: String(Math.round(state.plannedRestMs || 0)),
       confirmDeadline: '0',
     });
-    return { ok: true };
   } catch (e) {
     console.warn('[native] notifyRestDone 失败（不影响 App 内计时）', e);
     return { ok: false, reason: String(e) };

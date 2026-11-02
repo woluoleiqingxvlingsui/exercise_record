@@ -10,9 +10,25 @@ app/android/app/src/main/assets/public/
 app/android/app/src/main/assets/capacitor.config.json
 app/android/app/src/main/assets/capacitor.plugins.json
 
-# 签名密钥：绝不提交
-app/android/*.keystore
-app/android/keystore.properties
+# 签名密钥 / 本机环境：绝不提交
+*.keystore
+*.jks
+*.p12
+*.pfx
+*.pem
+*.key
+**/keystore.properties
+.env
+.env.*
+!.env.example
+!.env.sample
+
+# 文本导出的个人训练备份：推荐命名；不要笼统忽略所有 JSON
+exercise-record-backup*.json
+exercise-record-export*.json
+exercise-record-backup*.txt
+exercise-record-export*.txt
+/private-backups/
 
 # 编辑器 / 系统
 .vscode/

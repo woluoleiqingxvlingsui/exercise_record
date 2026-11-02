@@ -7,6 +7,10 @@
   "scripts": {
     "test": "node tests/run.js",
     "test:runner": "node --test tests/",
-    "preview": "python -m http.server 8899 --directory www"
+    "preview": "node scripts/serve.mjs www 8848",
+    "test:browser": "powershell -NoProfile -ExecutionPolicy Bypass -File tests/browser/run-views.ps1"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }

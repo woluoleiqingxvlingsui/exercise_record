@@ -119,9 +119,11 @@ public class RestTimerPlugin extends Plugin {
      */
     @PluginMethod
     public void consumeOpenTrain(PluginCall call) {
-        JSObject ret = new JSObject();
-        ret.put("open", MainActivity.consumePendingOpenTrain());
-        call.resolve(ret);
+        bridge.executeOnMainThread(() -> {
+            JSObject ret = new JSObject();
+            ret.put("open", MainActivity.consumePendingOpenTrain());
+            call.resolve(ret);
+        });
     }
 
     /**
@@ -131,20 +133,22 @@ public class RestTimerPlugin extends Plugin {
      */
     @PluginMethod
     public void setKeyboardMode(PluginCall call) {
-        try {
-            boolean sheetOpen = Boolean.TRUE.equals(call.getBoolean("sheetOpen", false));
-            MainActivity.setImeInsetEnabled(sheetOpen);
-            AppCompatActivity act = getActivity();
-            if (act instanceof MainActivity) {
-                android.webkit.WebView wv = ((MainActivity) act).getBridge().getWebView();
-                if (wv != null) {
-                    androidx.core.view.ViewCompat.requestApplyInsets(wv);
+        boolean sheetOpen = Boolean.TRUE.equals(call.getBoolean("sheetOpen", false));
+        bridge.executeOnMainThread(() -> {
+            try {
+                MainActivity.setImeInsetEnabled(sheetOpen);
+                AppCompatActivity act = getActivity();
+                if (act instanceof MainActivity) {
+                    android.webkit.WebView wv = ((MainActivity) act).getBridge().getWebView();
+                    if (wv != null) {
+                        androidx.core.view.ViewCompat.requestApplyInsets(wv);
+                    }
                 }
+            } catch (Exception e) {
+                Log.w(RestTimerService.TAG, "setKeyboardMode failed", e);
             }
-        } catch (Exception e) {
-            Log.w(RestTimerService.TAG, "setKeyboardMode failed", e);
-        }
-        call.resolve();
+            call.resolve();
+        });
     }
 
     // ------------------------------------------------------------------ 内部
@@ -153,6 +157,7 @@ public class RestTimerPlugin extends Plugin {
         JSONObject s = new JSONObject();
         try {
             putString(s, "sessionId", call.getString("sessionId"));
+            putString(s, "stepId", call.getString("stepId"));
             putString(s, "phase", call.getString("phase"));
             putString(s, "itemName", call.getString("itemName"));
             putString(s, "label", call.getString("label"));
@@ -190,7 +195,8 @@ public class RestTimerPlugin extends Plugin {
             try {
                 JSONObject prev = new JSONObject(raw);
                 if (sessionId != null && !sessionId.isEmpty()
-                        && sessionId.equals(prev.optString("sessionId", ""))) {
+                        && sessionId.equals(prev.optString("sessionId", ""))
+                        && s.optString("stepId", "").equals(prev.optString("stepId", ""))) {
                     applied = prev.optBoolean("autoApplied", false);
                     appliedAt = prev.optLong("autoAppliedAt", 0);
                 }
@@ -258,21 +264,23 @@ public class RestTimerPlugin extends Plugin {
         if (Build.VERSION.SDK_INT < 33) {
             return;
         }
-        AppCompatActivity activity = getActivity();
-        if (activity == null) {
-            return;
-        }
-        if (ActivityCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS)
-            == PackageManager.PERMISSION_GRANTED) {
-            return;
-        }
-        try {
-            ActivityCompat.requestPermissions(
-                activity,
-                new String[] { Manifest.permission.POST_NOTIFICATIONS },
-                NOTIF_PERMISSION_REQUEST_CODE);
-        } catch (Exception e) {
-            Log.w(RestTimerService.TAG, "notification permission request failed", e);
-        }
+        bridge.executeOnMainThread(() -> {
+            AppCompatActivity activity = getActivity();
+            if (activity == null || activity.isFinishing() || activity.isDestroyed()) {
+                return;
+            }
+            if (ActivityCompat.checkSelfPermission(activity, Manifest.permission.POST_NOTIFICATIONS)
+                == PackageManager.PERMISSION_GRANTED) {
+                return;
+            }
+            try {
+                ActivityCompat.requestPermissions(
+                    activity,
+                    new String[] { Manifest.permission.POST_NOTIFICATIONS },
+                    NOTIF_PERMISSION_REQUEST_CODE);
+            } catch (Exception e) {
+                Log.w(RestTimerService.TAG, "notification permission request failed", e);
+            }
+        });
     }
 }

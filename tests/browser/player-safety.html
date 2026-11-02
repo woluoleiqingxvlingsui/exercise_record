@@ -1,0 +1,146 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><title>播放器安全回归测试</title><link rel="stylesheet" href="../../www/css/app.css"></head>
+<body><main id="screen"></main><pre id="out">PENDING</pre><script type="module">
+import { createStore, memoryBackend } from '../../www/js/store.js';
+import { sessionFromPlan, completeStep } from '../../www/js/model.js';
+import { createPlayer } from '../../www/js/views/train.js';
+import { closeSheet } from '../../www/js/ui.js';
+import { notifyRestDone } from '../../www/js/native.js';
+const results = [], errors = [];
+window.addEventListener('error', e => errors.push(e.message));
+window.addEventListener('unhandledrejection', e => errors.push(String(e.reason)));
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const assert = (ok, message) => { if (!ok) throw new Error(message); };
+const click = el => { assert(el, '缺少按钮'); el.click(); };
+const inSheet = selector => document.querySelector('.sheet ' + selector);
+let player;
+function plan(repeat = 2, continuous = false) {
+  return { id: 'p', name: '回归计划', category: '力量', stages: [{ id: 's', kind: 'main', items: [{ id: 'i', name: '测试动作', mode: continuous ? 'duration' : 'reps', continuous, defaultRestMs: 45000, sets: { repeat, of: continuous ? { durationS: 30 } : { reps: 8 } } }] }] };
+}
+function mount(session, store = createStore(memoryBackend()), onFinish = () => {}) {
+  store.saveOngoing(session);
+  player = createPlayer({ store, session, onExit() {}, onFinish });
+  document.getElementById('screen').replaceChildren(player.root);
+  return { player, store };
+}
+function bridge(getState, updates = []) {
+  window.Capacitor = { isNativePlatform: () => true, Plugins: { RestTimer: {
+    getState, update: async state => { updates.push(state); return { ok: true }; },
+    stop: async () => ({ ok: true }), setKeyboardMode: async () => {},
+    restDone: async () => ({ ok: false, reason: 'test-rejection' }),
+  } } };
+}
+async function check(name, run) {
+  try { await run(); results.push('PASS  ' + name); }
+  catch (error) { results.push('FAIL  ' + name + ' :: ' + error.message); }
+  finally { player?.destroy(); player = null; closeSheet(); delete window.Capacitor; }
+}
+await check('最后一组灵活调整可以返回并完成训练', async () => {
+  const session = sessionFromPlan(plan(1));
+  const { player, store } = mount(session);
+  await player.start();
+  click(player.root.querySelector('[data-done]'));
+  click(inSheet('[data-flex]'));
+  assert(!inSheet('[data-plus]'), '最后一组不该有间歇控件');
+  click(inSheet('[data-back]'));
+  assert(inSheet('[data-plan]'), '返回失败');
+  click(inSheet('[data-flex]'));
+  click(inSheet('[data-start]'));
+  assert(session.entries.length === 1 && session.status === 'done', '最后一组未完成');
+  assert(store.getOngoing() === null, '结束后残留进行中状态');
+});
+await check('最后一组加组后重新显示间歇并继续训练', async () => {
+  const session = sessionFromPlan(plan(1));
+  const { player } = mount(session);
+  await player.start();
+  click(player.root.querySelector('[data-done]')); click(inSheet('[data-flex]'));
+  click(inSheet('[data-add-set]'));
+  assert(session.timeline.length === 2 && inSheet('[data-plus]'), '加组后没有刷新间歇控件');
+  click(inSheet('[data-start]'));
+  assert(session.status === 'ongoing' && session.cursor === 1, '加组后错误结束训练');
+  assert(player.root.querySelector('[data-ticker]'), '加组后未进入休息');
+});
+await check('连续段移出再放回DOM仍按原锚点计时', async () => {
+  const session = sessionFromPlan(plan(1, true));
+  const { player, store } = mount(session);
+  await player.start();
+  const anchor = store.getOngoing().playerState.continuousStartedAt;
+  player.root.remove();
+  await sleep(1200);
+  document.getElementById('screen').appendChild(player.root);
+  await sleep(350);
+  assert(player.root.querySelector('[data-cont-clock]').textContent !== '0:00', '切Tab后时钟停止');
+  assert(store.getOngoing().playerState.continuousStartedAt === anchor, '时钟锚点被重置');
+});
+await check('启动先读取原生状态再发送更新', async () => {
+  let release;
+  const pending = new Promise(resolve => { release = resolve; });
+  const updates = [];
+  bridge(() => pending, updates);
+  const session = sessionFromPlan(plan()); session.uiPhase = 'confirm';
+  const { player } = mount(session);
+  const ready = player.start();
+  assert(updates.length === 0, '读取前已经覆盖原生');
+  release({ state: JSON.stringify({ sessionId: session.id, stepId: session.timeline[0].id, phase: 'rest', autoApplied: true, restEndTs: Date.now() + 30000, plannedRestMs: 45000 }) });
+  await ready;
+  assert(session.entries.length === 1 && session.cursor === 1, '原生自动推进未认领');
+  assert(updates.length > 0 && updates[0].phase === 'rest', '恢复时写回错误阶段');
+});
+await check('原生已完成间歇时认领一次并进入下一组', async () => {
+  const session = sessionFromPlan(plan()); session.uiPhase = 'confirm';
+  bridge(async () => ({ state: JSON.stringify({ sessionId: session.id, stepId: session.timeline[0].id, phase: 'ready', autoApplied: true, restEndTs: 0, plannedRestMs: 45000 }) }));
+  const { player } = mount(session);
+  await player.start();
+  assert(session.entries.length === 1 && session.uiPhase === 'set', 'ready状态被重新当成未完成组');
+  assert(player.root.querySelector('[data-done]') && !player.root.querySelector('[data-ticker]'), 'ready重新开始休息');
+});
+await check('销毁后延迟原生读取不能复活训练或发送更新', async () => {
+  let release;
+  const updates = [];
+  bridge(() => new Promise(resolve => { release = resolve; }), updates);
+  const session = sessionFromPlan(plan()); session.uiPhase = 'confirm';
+  const { player, store } = mount(session);
+  const ready = player.start();
+  player.destroy(); store.clearOngoing();
+  release({ state: JSON.stringify({ sessionId: session.id, phase: 'ready', autoApplied: true }) });
+  await ready;
+  assert(updates.length === 0 && store.getOngoing() === null && session.entries.length === 0, '销毁后发生了异步写回');
+});
+await check('浏览器重新加载后继续原休息截止时间', async () => {
+  const session = sessionFromPlan(plan());
+  completeStep(session, {}, { restMs: 45000 });
+  session.uiPhase = 'rest';
+  const end = Date.now() + 30000;
+  session.playerState = { restEndTs: end, restTotalMs: 45000 };
+  const { player, store } = mount(session);
+  await player.start();
+  assert(player.root.querySelector('[data-ticker]'), '未恢复休息');
+  assert(store.getOngoing().playerState.restEndTs === end, '休息截止时间被重置');
+});
+await check('其他组的原生询问锚点不会触发当前组自动完成', async () => {
+  const session = sessionFromPlan(plan()); session.uiPhase = 'confirm';
+  const anchor = Date.now();
+  session.playerState = { confirmAt: anchor };
+  bridge(async () => ({ state: JSON.stringify({ sessionId: session.id, stepId: 'other-step', phase: 'confirm', anchorTs: anchor - 120000, confirmDeadline: anchor - 60000 }) }));
+  const { player, store } = mount(session);
+  await player.start();
+  assert(session.entries.length === 0 && session.uiPhase === 'confirm', '错用其他组截止时间');
+  assert(store.getOngoing().playerState.confirmAt === anchor, '询问锚点被其他组覆盖');
+});
+await check('其他连续段的原生锚点不会覆盖当前段', async () => {
+  const session = sessionFromPlan(plan(1, true));
+  const anchor = Date.now() - 1000;
+  session.playerState = { continuousStartedAt: anchor, continuousStepId: session.timeline[0].id };
+  bridge(async () => ({ state: JSON.stringify({ sessionId: session.id, stepId: 'other-step', phase: 'continuous', anchorTs: anchor - 60000 }) }));
+  const { player, store } = mount(session);
+  await player.start();
+  assert(store.getOngoing().playerState.continuousStartedAt === anchor, '连续段锚点被其他组覆盖');
+});
+await check('原生提醒返回失败不会被包装成成功', async () => {
+  bridge(async () => ({ state: '' }));
+  const result = await notifyRestDone({ sessionId: 'test' });
+  assert(result.ok === false, '原生失败被吞掉: ' + JSON.stringify(result));
+});
+await sleep(50);
+document.getElementById('out').textContent = JSON.stringify({ total: results.length, failed: results.filter(x => x.startsWith('FAIL')).length, errors, results }, null, 1);
+</script></body></html>

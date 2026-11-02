@@ -383,7 +383,7 @@ function openEditor(store, draft, onSaved) {
         ? (it.sets || []).map((s, k) => `
           <div class="card-soft is-flat stack" style="background:var(--bg-2)">
             <div class="row is-between"><span class="muted">第 ${k + 1} 组</span>
-              <button class="chip" data-del-set="${si}.${ii}">${icon('trash', 14)}</button></div>
+              <button class="chip" data-del-set="${si}.${ii}.${k}">${icon('trash', 14)}</button></div>
             <div class="row" style="gap:8px">${targetFields(s, `stages.${si}.items.${ii}.sets.${k}`)}</div>
           </div>`).join('')
         : `<div class="row" style="gap:8px">${targetFields(proto, `stages.${si}.items.${ii}.sets.of`)}</div>`}
@@ -471,10 +471,10 @@ function openEditor(store, draft, onSaved) {
     }));
 
     root.querySelectorAll('[data-del-set]').forEach((b) => b.addEventListener('click', () => {
-      const [si, ii] = b.dataset.delSet.split('.').map(Number);
+      const [si, ii, setIndex] = b.dataset.delSet.split('.').map(Number);
       const it = draft.stages[si].items[ii];
       if (it.sets.length <= 1) { toast('至少留一组'); return; }
-      it.sets.pop();
+      it.sets.splice(setIndex, 1);
       rerender();
     }));
   }

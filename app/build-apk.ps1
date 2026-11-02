@@ -19,7 +19,7 @@ $ToolsRoot = Join-Path $env:USERPROFILE 'tools'
 $JdkDir = Join-Path $ToolsRoot 'jdk-21'
 $SdkDir = Join-Path $ToolsRoot 'android-sdk'
 $GradleDir = Join-Path $ToolsRoot 'gradle-8.11.1'
-$InitGradle = Join-Path $env:USERPROFILE '.gradle\init.gradle'
+$InitGradle = Join-Path $RepoRoot '_out\gradle\mirrors.init.gradle'
 $OutDir = Join-Path $RepoRoot '_out\apk'
 
 function Write-Step($msg) { Write-Host "`n==> $msg" -ForegroundColor Cyan }
@@ -42,6 +42,8 @@ function Get-FileOrNull($url, $dest, $minBytes) {
 }
 
 # ---------------------------------------------------------------- Node.js
+# 在首次下载前创建目录（全新机器没有 tools）。
+New-Item -ItemType Directory -Force -Path $ToolsRoot | Out-Null
 # 以前这一步完全靠系统自带 Node，新机器上最容易卡住；这里缺就自动装。
 Write-Step 'Prepare Node.js (Capacitor CLI needs >= v20)'
 $NodeVer = 'v22.20.0'
@@ -146,8 +148,8 @@ if (Test-Path $gradleBin) {
 }
 
 # ---------------------------------------------------------------- mirrors + local.properties
-Write-Step 'Write Gradle mirrors init.gradle and local.properties'
-New-Item -ItemType Directory -Force -Path (Join-Path $env:USERPROFILE '.gradle') | Out-Null
+Write-Step 'Write project Gradle mirrors and local.properties'
+New-Item -ItemType Directory -Force -Path (Split-Path -Parent $InitGradle) | Out-Null
 $init = @"
 // CN mirrors for Gradle deps
 allprojects {
@@ -165,23 +167,8 @@ allprojects {
   }
 }
 "@
-# init.gradle 是【全局生效】的：改它会连带影响本机所有 Gradle 工程
-# （拾穗集，以及以后装的第三个项目）。所以内容不一致时先备份，绝不静默冲掉别人的配置。
-if (Test-Path $InitGradle) {
-  $cur = ([IO.File]::ReadAllText($InitGradle) -replace "`r`n", "`n").Trim()
-  if ($cur -eq $init.Trim()) {
-    # 内容一致就完全不碰它：init.gradle 是【全局生效】的，本机还有别的 Gradle 工程在用
-    Write-Host "  reuse $InitGradle（内容一致，不动它）"
-  } else {
-    $bak = "$InitGradle.bak"
-    if (Test-Path $bak) { $bak = "$InitGradle.bak-" + (Get-Date -Format 'yyyyMMdd-HHmmss') }
-    Copy-Item $InitGradle $bak
-    Write-Warn2 "已有的 $InitGradle 内容不同，已备份为 $(Split-Path -Leaf $bak) 后再覆盖"
-    [IO.File]::WriteAllText($InitGradle, $init, [Text.UTF8Encoding]::new($false))
-  }
-} else {
-  [IO.File]::WriteAllText($InitGradle, $init, [Text.UTF8Encoding]::new($false))
-}
+# 只通过本次 Gradle 调用加载；不读取、备份或改写用户的全局 init.gradle。
+[IO.File]::WriteAllText($InitGradle, $init, [Text.UTF8Encoding]::new($false))
 $sdkProp = $SdkDir.Replace('\', '\\')
 [IO.File]::WriteAllText((Join-Path $AndroidDir 'local.properties'), "sdk.dir=$sdkProp`n", [Text.UTF8Encoding]::new($false))
 
@@ -245,36 +232,34 @@ Write-Step 'Install app dependencies'
 $pkgJson = Join-Path $AppRoot 'package.json'
 $pkgLock = Join-Path $AppRoot 'package-lock.json'
 $stamp = Join-Path $AppRoot 'node_modules\.deps-stamp'
-$hash = ''
-if ((Test-Path $pkgJson) -and (Test-Path $pkgLock)) {
-  $hash = (Get-FileHash $pkgJson -Algorithm SHA256).Hash + ':' + (Get-FileHash $pkgLock -Algorithm SHA256).Hash
+if (-not (Test-Path $pkgJson) -or -not (Test-Path $pkgLock)) {
+  throw '缺少 app/package.json 或 package-lock.json；请恢复入库的锁文件，不自动生成新锁文件。'
 }
-# node_modules 随项目自带（可离线复用）：Capacitor CLI 在位就直接跳过 npm。
-# 踩坑记录：本机 npm 镜像把 package-lock 里的 @types/node "*" 解析成了并不存在的
-# 26.6.3，导致 npm ci / npm install 双双失败，且 npm ci 先一步把 node_modules 清空。
-# 依赖本已完整 vendored，构建根本不需要 npm，所以这里以「CLI 在位」为准。
-# 确实要重装依赖时： -ForceDeps
-$cliOk = Test-Path (Join-Path $AppRoot 'node_modules\@capacitor\cli\package.json')
-$needDeps = $ForceDeps -or (-not $cliOk)
-if (-not $needDeps) {
-  Write-Host '  复用自带 node_modules（Capacitor CLI 在位），跳过 npm'
+$hash = (Get-FileHash $pkgJson -Algorithm SHA256).Hash + ':' + (Get-FileHash $pkgLock -Algorithm SHA256).Hash
+$previousHash = if (Test-Path $stamp) { [IO.File]::ReadAllText($stamp).Trim() } else { '' }
+$depsOk = $true
+foreach ($dependency in @('@capacitor\cli\bin\capacitor', '@capacitor\android\capacitor\build.gradle', '@capacitor\core\package.json', '.bin\cap.cmd')) {
+  if (-not (Test-Path (Join-Path $AppRoot "node_modules\$dependency"))) { $depsOk = $false }
 }
+# npm ls 同时检查传递依赖、版本与缺失文件，不能只看 CLI 的一个 package.json。
+if ($depsOk -and $previousHash -eq $hash -and -not $ForceDeps) {
+  Push-Location $AppRoot
+  try { npm ls --all --offline --no-audit --no-fund *> $null; $depsOk = ($LASTEXITCODE -eq 0) }
+  finally { Pop-Location }
+}
+$needDeps = $ForceDeps -or (-not $depsOk) -or ($previousHash -ne $hash)
 if ($needDeps) {
+  Remove-Item -LiteralPath $stamp -Force -ErrorAction SilentlyContinue
   Push-Location $AppRoot
   try {
-    if (Test-Path $pkgLock) {
-      npm ci --prefer-offline --no-audit --no-fund
-      if ($LASTEXITCODE -ne 0) {
-        Write-Warn2 'npm ci 失败，回退 npm install（lockfile 可能与 package.json 不同步）'
-        npm install --prefer-offline --no-audit --no-fund
-      }
-    } else {
-      npm install --prefer-offline --no-audit --no-fund
-    }
-    if ($LASTEXITCODE -ne 0) { throw 'npm install failed' }
+    npm ci --include=dev --prefer-offline --no-audit --no-fund
+    if ($LASTEXITCODE -ne 0) { throw 'npm ci 失败；请检查网络、npm 源与锁文件一致性。不会回退 npm install 或改写锁文件。' }
+    npm ls --all --offline --no-audit --no-fund *> $null
+    if ($LASTEXITCODE -ne 0) { throw '安装后的依赖树不完整，未写入依赖 stamp。' }
   } finally { Pop-Location }
-  New-Item -ItemType Directory -Force -Path (Join-Path $AppRoot 'node_modules') | Out-Null
   [IO.File]::WriteAllText($stamp, "$hash`n", [Text.UTF8Encoding]::new($false))
+} else {
+  Write-Host '  package/lock 指纹及依赖树一致，复用 node_modules'
 }
 
 # ---------------------------------------------------------------- build
@@ -282,13 +267,13 @@ $gradleTask = if ($Release) { 'assembleRelease' } else { 'assembleDebug' }
 Write-Step "Capacitor sync + $gradleTask"
 Push-Location $AppRoot
 try {
-  npx cap sync android
+  & (Join-Path $AppRoot 'node_modules\.bin\cap.cmd') sync android
   if ($LASTEXITCODE -ne 0) { throw 'cap sync failed' }
 } finally { Pop-Location }
 
 Push-Location $AndroidDir
 try {
-  & $gradleBin $gradleTask --no-daemon
+  & $gradleBin $gradleTask --no-daemon --init-script $InitGradle
   if ($LASTEXITCODE -ne 0) { throw "$gradleTask failed ($LASTEXITCODE)" }
 } finally { Pop-Location }
 
