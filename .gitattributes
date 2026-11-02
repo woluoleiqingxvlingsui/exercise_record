@@ -1,0 +1,5 @@
+# gradlew 是 shell 脚本，任何平台都必须以 LF 检出。
+# 若被 core.autocrlf 转成 CRLF，Linux / Mac 上会直接报
+#   /bin/sh^M: bad interpreter: No such file or directory
+# 脚本根本跑不起来。可执行位由 git 的 file mode（100755）单独记录。
+app/android/gradlew text eol=lf

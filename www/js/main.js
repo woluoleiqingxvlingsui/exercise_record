@@ -2,7 +2,7 @@
  * main.js —— 应用入口：装存储、铺示例、Tab 路由、训练会话编排、设置。
  */
 
-import { initBrowserStore } from './store.js';
+import { initBrowserStore, SCHEMA_VERSION } from './store.js';
 import { seedPlans, shouldSeed } from './seed.js';
 import { localDateKey } from './util.js';
 import { sessionFromPlan, upsertDay } from './model.js';
@@ -382,7 +382,7 @@ function openSettings() {
         if (!(await confirmSheet({ title: '清空全部数据', message: '计划、记录、日程全部删除，无法恢复！建议先导出备份。', okText: '确认清空', danger: true }))) return;
         store.wipeAll();
         // seeded 保持 true：清空是用户主动要的，别让示例计划下次启动又长回来
-        store.saveMeta({ ...store.getMeta(), schemaVersion: 1, seeded: true });
+        store.saveMeta({ ...store.getMeta(), schemaVersion: SCHEMA_VERSION, seeded: true });
         closeSheet();
         toast('已清空');
         switchTab('plans');

@@ -111,6 +111,8 @@ node tests/run.js                                                     # 纯逻�
 powershell -ExecutionPolicy Bypass -File tests\browser\run-views.ps1   # 前端集成，40 项，无头浏览器
 ```
 
+双击 `run-tests.bat` 等价于第一条（跑完停住等你看了结果再关窗）。
+
 - **纯逻辑**（模型 / 存储 / 日期 / 示例数据 / 导入导出往返 / 模块导入导出匹配 / 回归守卫）：不需要浏览器也不需要手机。
 - **前端集成**：用无头 Edge/Chrome 真实加载页面，把计划编辑器、训练主流程（完成本组 → 询问 → 灵活调整 → 倒计时 → 下一组）、日历、统计、反馈表单都点一遍，并断言「灵活调整里**原计划间歇**确实显示出来、且记录里同时留下计划值与实际值」。加 `-Headed` 可以看着它跑。
 - **回归守卫**（`tests/regress.test.js`）：2026-11-02 那次只读审计发现的缺陷（替换式导入会清库、`ex.meta` 损坏导致记录静默消失、写入顺序留下孤儿记录、最后一组选间歇被默默丢弃…）都补了断言 —— 那批问题原来 67 项测试一条都没覆盖，全绿也拦不住。
@@ -180,7 +182,7 @@ exercise_record/
 | 坑 | 现象 | 处理 |
 |---|---|---|
 | **PowerShell 脚本 BOM** | `build-apk.ps1` 被改写后中文串乱码、报 `Unexpected token '}'` | Windows PowerShell 5.1 按 ANSI 读 `.ps1`，**必须存成 UTF-8 with BOM** |
-| **npm 装不上** | 镜像把 `@types/node "*"` 解析成不存在的 `26.6.3`，`npm ci` 先把 `node_modules` 清空再失败 | 依赖已 vendored，`build-apk.ps1` 检测到 Capacitor CLI 在位就**跳过 npm**（要重装加 `-ForceDeps`）。`app/package-lock.json` 已入库，别人 clone 下来装的是同一批版本；本机若要强制重装，会先试 `npm ci`，失败再回退 `npm install` |
+| **npm 装不上** | 镜像把 `@types/node "*"` 解析成不存在的 `26.6.3`，`npm ci` 先把 `node_modules` 清空再失败 | 依赖已 vendored，`build-apk.ps1` 检测到 Capacitor CLI 在位就**跳过 npm**（要重装加 `-ForceDeps`）。`app/package-lock.json` 已入库且**带 `resolved` + `integrity`**（对着 `registry.npmjs.org` 生成的，不是镜像地址），别人 clone 下来 `npm ci` 装到的是同一批来源并校验哈希；本机若要强制重装，会先试 `npm ci`，失败再回退 `npm install` |
 | **`init.gradle` 是全局的** | 原脚本每次都会重写 `~/.gradle/init.gradle`，会影响本机其它 Gradle 工程 | 内容一致就**完全不碰**，不一致才备份后覆盖 |
 | **Gradle 缓存不在工作区** | 沙箱下构建被拒（Gradle 要写 `~/.gradle/caches`） | 构建时放宽文件访问；也正因如此，`node_modules` 才选择 vendored 以便离线 |
 | **ES 模块导入不存在的名字** | 浏览器端 `SyntaxError: does not provide an export named ...`，**整页白屏**，`node --check` 查不出来 | 新增 `tests/imports.test.js` 静态校验所有具名导入/导出匹配 |
