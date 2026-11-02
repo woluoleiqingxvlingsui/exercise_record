@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  通知栏小图标：只取 alpha 通道，颜色被系统忽略。
+  画一只秒表（表身 + 顶部按钮 + 指针），描边即可，无需填充。
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+
+    <!-- 顶部按钮 -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M10.75,2.5 h2.5 v2 h-2.5 z" />
+
+    <!-- 表身 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.9"
+        android:pathData="M12,13 m-7.6,0 a7.6,7.6 0 1,0 15.2,0 a7.6,7.6 0 1,0 -15.2,0" />
+
+    <!-- 指针 -->
+    <path
+        android:fillColor="#00000000"
+        android:strokeColor="#FFFFFFFF"
+        android:strokeWidth="1.9"
+        android:strokeLineCap="round"
+        android:pathData="M12,13 V8.6" />
+</vector>

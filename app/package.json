@@ -1,0 +1,20 @@
+{
+  "name": "exercise-record-app",
+  "version": "0.7.0",
+  "private": true,
+  "description": "训练记录 Android 混合壳（Capacitor）",
+  "scripts": {
+    "sync": "cap sync android",
+    "copy": "cap copy android",
+    "open": "cap open android",
+    "build:debug": "cap sync android && cd android && gradlew.bat assembleDebug",
+    "test": "node --test ../tests/"
+  },
+  "dependencies": {
+    "@capacitor/android": "7.6.9",
+    "@capacitor/core": "7.6.9"
+  },
+  "devDependencies": {
+    "@capacitor/cli": "7.6.9"
+  }
+}

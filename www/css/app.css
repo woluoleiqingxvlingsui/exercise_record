@@ -1,0 +1,450 @@
+/* ==========================================================================
+   训练记录 —— 可爱卡通设计系统
+   零依赖：只有 CSS 自定义属性 + 组件类，不引任何框架，便于整体调色。
+   风格关键词：圆润、贴纸感、柔和高饱和、手绘小角色、整体"软"。
+   ========================================================================== */
+
+/* --------------------------------------------------------------------------
+   1. 设计令牌
+   -------------------------------------------------------------------------- */
+:root {
+  /* 底色与文字：奶油底 + 软黑紫（刻意不用纯黑，避免生硬） */
+  --bg:            #fff8f0;
+  --bg-2:          #fff1f5;
+  --surface:       #ffffff;
+  --ink:           #4a3f55;
+  --ink-soft:      #8a7e95;
+  --ink-faint:     #b9aec3;
+  --line:          #ece0d6;
+
+  /* 类别主色：力量 = 珊瑚粉，有氧 = 薄荷绿 */
+  --strength:      #ff8fa3;
+  --strength-dk:   #e5647c;
+  --strength-bg:   #ffe4ea;
+
+  --cardio:        #7ed9c0;
+  --cardio-dk:     #4fbfa1;
+  --cardio-bg:     #ddf6ef;
+
+  /* 日程页专用：训练标记**只用这一个颜色**，不再按类别分色（见 views/calendar.js） */
+  --trained:       #ff5f7e;
+  --trained-bg:    #ffe4ea;
+
+  /* 辅助色 */
+  --accent:        #ffd166;
+  --accent-dk:     #e5b23f;
+  --purple:        #c6a8e0;
+  --purple-dk:     #a385c4;
+  --blue:          #8ecae6;
+  --blue-dk:       #63aecd;
+  --danger:        #ff7b7b;
+  --danger-dk:     #e35d5d;
+
+  /* 形状：大圆角 + 同色系描边 + 底部实心投影（贴纸厚度感） */
+  --r-card:        24px;
+  --r-btn:         20px;
+  --r-chip:        999px;
+  --stroke:        2.5px;
+  --stroke-thin:   2px;
+  --shadow-y:      4px;
+  --shadow-y-lg:   6px;
+
+  /* 间距与字号 */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px;
+  --sp-4: 16px; --sp-5: 20px; --sp-6: 24px; --sp-7: 32px;
+
+  --fs-xs: 12px; --fs-sm: 14px; --fs-md: 16px;
+  --fs-lg: 20px; --fs-xl: 26px; --fs-2xl: 34px;
+
+  /* 数字字体：优先圆体，未内嵌时干净回退到系统字体栈 */
+  --font-ui: 'MiSans', 'HarmonyOS Sans SC', 'PingFang SC', 'Microsoft YaHei',
+             system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-num: 'Fredoka', 'Baloo 2', var(--font-ui);
+
+  /* 动效 */
+  --ease-pop: cubic-bezier(.34, 1.56, .64, 1);
+  --dur: 160ms;
+}
+
+/* --------------------------------------------------------------------------
+   2. 基础
+   -------------------------------------------------------------------------- */
+* { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+}
+
+body {
+  background: var(--bg);
+  color: var(--ink);
+  font-family: var(--font-ui);
+  font-size: var(--fs-md);
+  line-height: 1.5;
+  overscroll-behavior-y: none;
+  /* 安全区：刘海屏 + 底部手势条 */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+}
+
+button, input, select, textarea { font-family: inherit; font-size: inherit; color: inherit; }
+button { cursor: pointer; border: none; background: none; }
+h1, h2, h3, h4 { margin: 0; font-weight: 800; letter-spacing: .2px; }
+
+/* 大数字（倒计时、次数、时长）：等宽数字避免跳动 */
+.num {
+  font-family: var(--font-num);
+  font-variant-numeric: tabular-nums;
+  font-weight: 700;
+  letter-spacing: .5px;
+}
+
+/* --------------------------------------------------------------------------
+   3. 贴纸按钮 —— 描边 + 底部实心投影，按下位移
+   -------------------------------------------------------------------------- */
+.btn-sticker {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--sp-2);
+  min-height: 48px;                    /* 触摸目标 >= 44px */
+  padding: 12px 20px;
+  border: var(--stroke) solid var(--ink);
+  border-radius: var(--r-btn);
+  background: var(--surface);
+  color: var(--ink);
+  font-weight: 800;
+  font-size: var(--fs-md);
+  box-shadow: 0 var(--shadow-y) 0 var(--ink);
+  transition: transform var(--dur) var(--ease-pop),
+              box-shadow var(--dur) var(--ease-pop);
+}
+.btn-sticker:active {
+  transform: translateY(var(--shadow-y));
+  box-shadow: 0 0 0 var(--ink);
+}
+.btn-sticker[disabled] {
+  opacity: .45;
+  box-shadow: 0 var(--shadow-y) 0 var(--ink-faint);
+  border-color: var(--ink-faint);
+  pointer-events: none;
+}
+
+/* 主色变体：用类别色填充 */
+.btn-sticker.is-strength { background: var(--strength); border-color: var(--strength-dk); box-shadow: 0 var(--shadow-y) 0 var(--strength-dk); color: #fff; }
+.btn-sticker.is-strength:active { box-shadow: 0 0 0 var(--strength-dk); }
+.btn-sticker.is-cardio   { background: var(--cardio);   border-color: var(--cardio-dk);   box-shadow: 0 var(--shadow-y) 0 var(--cardio-dk);   color: #fff; }
+.btn-sticker.is-cardio:active { box-shadow: 0 0 0 var(--cardio-dk); }
+.btn-sticker.is-accent   { background: var(--accent);   border-color: var(--accent-dk);   box-shadow: 0 var(--shadow-y) 0 var(--accent-dk); }
+.btn-sticker.is-accent:active { box-shadow: 0 0 0 var(--accent-dk); }
+.btn-sticker.is-ghost    { background: var(--surface); }
+.btn-sticker.is-big      { min-height: 60px; font-size: var(--fs-lg); border-radius: var(--r-card); width: 100%; }
+.btn-sticker.is-sm       { min-height: 40px; padding: 8px 14px; font-size: var(--fs-sm); }
+
+/* --------------------------------------------------------------------------
+   4. 柔和卡片
+   -------------------------------------------------------------------------- */
+.card-soft {
+  background: var(--surface);
+  border: var(--stroke) solid var(--line);
+  border-radius: var(--r-card);
+  padding: var(--sp-4);
+  box-shadow: 0 var(--shadow-y) 0 rgba(74, 63, 85, .06);
+}
+.card-soft.is-flat { box-shadow: none; }
+
+/* --------------------------------------------------------------------------
+   5. Chip（类别标签 / 快捷选择）
+   -------------------------------------------------------------------------- */
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 36px;
+  padding: 6px 14px;
+  border: var(--stroke-thin) solid var(--line);
+  border-radius: var(--r-chip);
+  background: var(--surface);
+  color: var(--ink-soft);
+  font-size: var(--fs-sm);
+  font-weight: 700;
+  transition: transform var(--dur) var(--ease-pop);
+}
+.chip.is-on {
+  background: var(--accent);
+  border-color: var(--accent-dk);
+  color: var(--ink);
+}
+.chip.is-on.is-strength { background: var(--strength); border-color: var(--strength-dk); color: #fff; }
+.chip.is-on.is-cardio   { background: var(--cardio);   border-color: var(--cardio-dk);   color: #fff; }
+.chip:active { transform: scale(.94); }
+
+/* 类别色点 */
+.dot { width: 10px; height: 10px; border-radius: 50%; display: inline-block; flex: none; }
+.dot.is-strength { background: var(--strength); }
+.dot.is-cardio   { background: var(--cardio); }
+
+/* --------------------------------------------------------------------------
+   5b. 训练日程（月视图）
+   --------------------------------------------------------------------------
+   折叠态每格一个方格 + 一个圆点；展开态格子变高，下面直接列出当天练了什么。
+   行高统一挂在 --cal-row 上：拖动时 JS 实时改它（界面跟着手指走），
+   松手去掉 .is-dragging，过渡把行高送到位（吸附）。
+   -------------------------------------------------------------------------- */
+
+/* 注册成 <length> 才能插值过渡；老浏览器不认得 @property 也不会坏，只是退化成瞬变 */
+@property --cal-row {
+  syntax: '<length>';
+  inherits: true;
+  initial-value: 48px;
+}
+
+.cal { padding: var(--sp-3); }
+
+.cal-head, .cal-grid {
+  display: grid;
+  grid-template-columns: repeat(7, 1fr);
+  gap: 2px;
+}
+/* 日历网格里的上下滑手势**独占**：只用来展开/收起，不带动页面滚动。
+   不加这条，展开后页面变长，"上滑收起"会和"上滑翻页面"抢同一根手指，手感发涩。 */
+.cal-grid {
+  touch-action: none;
+  --cal-row: 48px;                                   /* 折叠态：正方形，JS 会按列宽校准 */
+  transition: --cal-row 240ms cubic-bezier(.22, .8, .3, 1);
+}
+/* 拖动过程中绝不加过渡，否则行高会"追着手指跑"，粘滞感就是这么来的 */
+.cal-grid.is-dragging { transition: none; }
+/* 首帧落地同样不要过渡：新节点会从 CSS 默认值"长"到目标高度，页面刚开就自己动一下 */
+.cal-grid.is-instant { transition: none; }
+.cal-head { margin-bottom: 4px; }
+
+.cal-cell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: flex-start;
+  gap: 3px;
+  height: var(--cal-row);              /* 折叠态正好是列宽（正方形），展开态由 JS 拉伸 */
+  padding: 4px 1px 2px;
+  border: var(--stroke) solid transparent;
+  border-radius: 14px;
+  background: transparent;
+  font-weight: 700;
+  overflow: hidden;
+  transition: background var(--dur) var(--ease-pop),
+              border-color var(--dur) var(--ease-pop);
+}
+.cal-cell .d { font-size: var(--fs-sm); line-height: 1.15; }
+.cal-cell.is-today .d { color: var(--trained); font-weight: 800; }
+.cal-cell.is-sel { border-color: var(--ink); background: var(--bg-2); }
+.cal-cell:active { background: var(--bg-2); }
+
+/* 训练标记：一个颜色，一种形状语义 —— 实心=练过，描边=有安排没练 */
+.cal-mark {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  flex: none;
+  background: var(--trained);
+}
+.cal-mark.is-plan { background: transparent; border: 2.5px solid var(--trained); }
+.cal-mark.is-none { background: transparent; }
+
+.cal-rest {
+  position: absolute;
+  top: 2px;
+  right: 3px;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--ink-faint);
+}
+
+/* 展开态才出现的当天条目 */
+.cal-events {
+  display: none;
+  width: 100%;
+  flex-direction: column;
+  align-items: stretch;
+  gap: 2px;
+  overflow: hidden;
+}
+.cal-grid.is-open .cal-events { display: flex; }
+/* 展开后圆点就让位给条目：实心/虚线 chip 本身已经说明"练过 / 有安排"，留着只是多一层噪音 */
+.cal-grid.is-open .cal-mark { display: none; }
+.cal-grid.is-open .cal-cell { gap: 4px; }
+
+.cal-ev {
+  display: block;
+  padding: 2px 5px;
+  border-radius: 6px;
+  background: var(--trained-bg);
+  color: var(--strength-dk);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.45;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  text-align: center;                   /* 格子窄，居中比靠左好读 */
+}
+.cal-ev.is-plan { background: transparent; border: 1px dashed var(--trained); color: var(--trained); }
+
+/* 装不下的条目折成同高的小药丸 "+N"，不再另起一行挤空间 */
+.cal-more {
+  font-size: 9px;
+  font-weight: 700;
+  line-height: 1.3;
+  color: var(--ink-faint);
+  text-align: center;
+  padding: 2px 5px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+/* 日程操作：三等分，图标和文案保持单行，小屏也有足够的触摸高度。 */
+.cal-actions {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.cal-actions .chip {
+  min-width: 0;
+  min-height: 44px;
+  justify-content: center;
+  gap: 4px;
+  padding: 8px 4px;
+  border-radius: 14px;
+  color: var(--ink);
+  font-size: clamp(12px, 3.6vw, 14px);
+  line-height: 1.25;
+  white-space: nowrap;
+}
+.cal-actions .chip svg { flex-shrink: 0; }
+
+/* 类别 chip 长按管理：禁掉系统的长按菜单/选中，否则会先弹出复制菜单 */
+.chip.is-longpress {
+  user-select: none;
+  -webkit-user-select: none;
+  -webkit-touch-callout: none;
+}
+
+/* --------------------------------------------------------------------------
+   6. 应用外壳：顶栏 + 内容区 + 底部 Tab
+   -------------------------------------------------------------------------- */
+#app {
+  display: flex;
+  flex-direction: column;
+  /* 只用 100vh，刻意不写 100dvh：键盘弹出时 dvh 有可能跟着缩，
+     那样贴底的 Tab 栏又会被顶上去（这个 bug 真的出现过）。 */
+  min-height: 100vh;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  gap: var(--sp-3);
+  padding: var(--sp-4) var(--sp-4) var(--sp-2);
+}
+.topbar .title { font-size: var(--fs-xl); font-weight: 800; flex: 1; }
+
+.screen {
+  flex: 1;
+  /* 键盘弹出时由 JS 把键盘高度写进 --kb，给内容留出滚动空间，
+     好让被聚焦的输入框能滚到键盘上方；底栏本身不跟着动（被盖住没关系）。 */
+  padding: 0 var(--sp-4) calc(var(--sp-6) + var(--kb, 0px));
+  animation: slide-in var(--dur) var(--ease-pop);
+}
+.screen[hidden] { display: none; }
+
+@keyframes slide-in {
+  from { opacity: 0; transform: translateY(8px); }
+  to   { opacity: 1; transform: none; }
+}
+
+.tabbar {
+  position: sticky;
+  bottom: 0;
+  display: flex;
+  gap: var(--sp-1);
+  padding: var(--sp-2) var(--sp-3) calc(var(--sp-2) + env(safe-area-inset-bottom));
+  background: var(--surface);
+  border-top: var(--stroke) solid var(--line);
+}
+.tabbar button {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: var(--sp-2) 0;
+  border-radius: var(--r-btn);
+  color: var(--ink-faint);
+  font-size: var(--fs-xs);
+  font-weight: 800;
+  transition: transform var(--dur) var(--ease-pop);
+}
+.tabbar button svg { width: 24px; height: 24px; }
+.tabbar button.is-on { color: var(--ink); background: var(--bg-2); }
+.tabbar button:active { transform: scale(.92); }
+
+/* --------------------------------------------------------------------------
+   7. 通用小工具
+   -------------------------------------------------------------------------- */
+.row { display: flex; align-items: center; gap: var(--sp-3); }
+.row.is-between { justify-content: space-between; }
+.stack { display: flex; flex-direction: column; gap: var(--sp-3); }
+.muted { color: var(--ink-soft); font-size: var(--fs-sm); }
+.center { text-align: center; }
+.empty { text-align: center; color: var(--ink-soft); padding: var(--sp-7) var(--sp-4); }
+.empty svg { width: 96px; height: 96px; margin-bottom: var(--sp-3); }
+
+/* 弹层（底部抽屉） */
+.sheet-mask {
+  position: fixed;
+  inset: 0;
+  background: rgba(74, 63, 85, .35);
+  display: flex;
+  align-items: flex-end;
+  z-index: 50;
+  animation: fade-in var(--dur) ease;
+}
+.sheet-mask[hidden] { display: none; }
+.sheet {
+  width: 100%;
+  background: var(--bg);
+  border-top: var(--stroke) solid var(--ink);
+  border-radius: var(--r-card) var(--r-card) 0 0;
+  padding: var(--sp-5) var(--sp-4) calc(var(--sp-5) + env(safe-area-inset-bottom));
+  max-height: 88vh;
+  overflow-y: auto;
+  animation: sheet-up 220ms var(--ease-pop);
+}
+@keyframes fade-in { from { opacity: 0; } to { opacity: 1; } }
+@keyframes sheet-up { from { transform: translateY(100%); } to { transform: none; } }
+
+/* "原计划参考" 条：灵活调整时引导用户对照预设时长 */
+.ref-banner {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--sp-3);
+  padding: var(--sp-3) var(--sp-4);
+  border: var(--stroke) dashed var(--purple-dk);
+  border-radius: var(--r-btn);
+  background: #f6f0fb;
+}
+.ref-banner .label { font-size: var(--fs-sm); color: var(--ink-soft); font-weight: 700; }
+.ref-banner .value { font-size: var(--fs-lg); font-weight: 800; color: var(--purple-dk); }
+
+/* 尊重系统"减少动效" */
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: .01ms !important;
+    transition-duration: .01ms !important;
+  }
+}

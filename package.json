@@ -1,0 +1,12 @@
+{
+  "name": "exercise-record",
+  "version": "0.7.0",
+  "private": true,
+  "type": "module",
+  "description": "训练记录 —— 预设计划 / 组间歇通知栏倒计时 / 训练中灵活调整 / 训练后反馈 / 训练日程",
+  "scripts": {
+    "test": "node tests/run.js",
+    "test:runner": "node --test tests/",
+    "preview": "python -m http.server 8899 --directory www"
+  }
+}

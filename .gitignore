@@ -1,0 +1,28 @@
+# 构建产物与依赖
+_out/
+app/node_modules/
+app/android/build/
+app/android/app/build/
+app/android/.gradle/
+app/android/local.properties
+app/android/capacitor-cordova-android-plugins/
+app/android/app/src/main/assets/public/
+app/android/app/src/main/assets/capacitor.config.json
+app/android/app/src/main/assets/capacitor.plugins.json
+
+# 签名密钥：绝不提交
+app/android/*.keystore
+app/android/keystore.properties
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+*.log
+Thumbs.db
+desktop.ini
+
+# 本地预览/冒烟测试的临时产物
+.browser-profile/
+server*.log
+s1.log
+s2.log

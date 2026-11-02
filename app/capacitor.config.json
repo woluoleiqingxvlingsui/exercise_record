@@ -1,0 +1,9 @@
+{
+  "appId": "app.exercise.record",
+  "appName": "训练记录",
+  "webDir": "../www",
+  "backgroundColor": "#fff8f0",
+  "android": {
+    "adjustMarginsForEdgeToEdge": "auto"
+  }
+}

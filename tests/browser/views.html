@@ -1,0 +1,853 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>视图集成冒烟测试</title>
+<link rel="stylesheet" href="../../www/css/app.css">
+</head>
+<body>
+<!-- 需要一份 index.html 外壳里的关键节点：main.js / 各视图会 getElementById 取它们 -->
+<div id="app">
+  <div class="topbar"><div class="title">训练记录</div><button class="chip" id="btn-settings"></button></div>
+  <div class="screen" id="screen"></div>
+  <div class="tabbar" id="tabbar">
+    <button data-tab="plans">计划</button><button data-tab="train">训练</button>
+    <button data-tab="calendar">日历</button><button data-tab="stats">统计</button>
+  </div>
+</div>
+<pre id="out">PENDING</pre>
+
+<script type="module">
+import { createStore, memoryBackend } from '../../www/js/store.js';
+import { seedPlans } from '../../www/js/seed.js';
+import { sessionFromPlan, completeStep, finishSession, upsertDay, buildTimeline } from '../../www/js/model.js';
+import { renderPlans } from '../../www/js/views/plans.js';
+import { createPlayer } from '../../www/js/views/train.js';
+import { renderCalendar } from '../../www/js/views/calendar.js';
+import { renderStats, openSessionDetail } from '../../www/js/views/history.js';
+import { openSheet, closeSheet } from '../../www/js/ui.js';
+import { localDateKey, fmtRest, periodRange } from '../../www/js/util.js';
+
+/* ------------------------------------------------------------ 测试脚手架 */
+
+const results = [];
+const errors = [];
+
+window.addEventListener('error', (e) => errors.push('window.error: ' + e.message));
+window.addEventListener('unhandledrejection', (e) => errors.push('rejection: ' + (e.reason && e.reason.message ? e.reason.message : e.reason)));
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+function check(name, fn) {
+  try {
+    fn();
+    results.push('PASS  ' + name);
+  } catch (e) {
+    results.push('FAIL  ' + name + ' :: ' + (e && e.message ? e.message : e));
+  }
+}
+
+function assert(cond, msg) {
+  if (!cond) throw new Error(msg || 'assert failed');
+}
+
+const click = (el) => {
+  assert(el, '要点击的元素不存在');
+  el.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+};
+
+const setInput = (el, value) => {
+  assert(el, '要输入的元素不存在');
+  el.value = value;
+  el.dispatchEvent(new Event('input', { bubbles: true }));
+};
+
+const screen = document.getElementById('screen');
+const sheet = () => document.querySelector('.sheet');
+const inSheet = (sel) => document.querySelector('.sheet ' + sel);
+
+function closeAnySheet() {
+  const mask = document.querySelector('.sheet-mask');
+  if (mask) mask.remove();
+}
+
+/* ------------------------------------------------------------------ 数据 */
+
+const store = createStore(memoryBackend());
+seedPlans().forEach((p) => store.savePlan(p));
+
+/** 造一条已完成的记录，供统计/日历/详情用 */
+function seedFinishedSession(plan, daysAgo = 0) {
+  const t = Date.now() - daysAgo * 86400000;
+  const s = sessionFromPlan(plan, t);
+  const tl = buildTimeline(plan);
+  s.cursor = 0;
+  completeStep(s, { reps: 8, weightKg: 10 });
+  completeStep(s, { reps: 6, weightKg: 10 }, { restMs: 60000, decision: 'flex' });
+  finishSession(s, 'done', t + 3600000);
+  store.commitSession(s);
+  const sched = store.getSchedule();
+  upsertDay(sched, s.dateKey, { sessionId: s.id });
+  store.saveSchedule(sched);
+  return s;
+}
+
+const pullup = store.listPlans().find((p) => p.name === '引体日');
+const finished = seedFinishedSession(pullup, 0);
+
+/* -------------------------------------------------------------- 一、计划页 */
+
+check('计划列表渲染出全部示例计划', () => {
+  renderPlans(screen, { store, onStart: () => {} });
+  const txt = screen.textContent;
+  ['引体日', '推日', '日常有氧跑', '强度跑', '长距离跑'].forEach((n) => {
+    assert(txt.includes(n), `计划列表缺少「${n}」`);
+  });
+  assert(screen.querySelectorAll('[data-plan]').length === 5, '计划卡片数量不对');
+});
+
+check('★ 计划卡片有「查看」只读入口，且查看不改动任何数据', () => {
+  closeAnySheet();
+  const before = JSON.stringify(store.listPlans());
+  const card = screen.querySelector('[data-plan]');
+  assert(card.querySelector('[data-view]'), '计划卡片上没有「查看」按钮');
+  click(card.querySelector('[data-view]'));
+  assert(sheet(), '查看弹层没打开');
+  assert(sheet().textContent.includes('查看计划'), '查看弹层标题不对');
+  // 关键：只读查看里不能出现任何可编辑控件，否则还是会误操作
+  const editable = document.querySelectorAll('.sheet input, .sheet textarea, .sheet select');
+  assert(editable.length === 0, `只读查看里出现了 ${editable.length} 个可编辑控件`);
+  assert(inSheet('[data-close-view]'), '只读查看没有「关闭」按钮');
+  click(inSheet('[data-close-view]'));
+  assert(JSON.stringify(store.listPlans()) === before, '只读查看居然改动了计划数据');
+});
+
+check('新建计划 → 编辑器打开且能结构操作', () => {
+  closeAnySheet();
+  click(screen.querySelector('[data-new]'));
+  assert(sheet(), '编辑器弹层没打开');
+  assert(inSheet('[data-path="name"]'), '没有名称输入框');
+
+  // 加一个阶段、给第一个阶段加一个动作
+  click(inSheet('[data-add-stage]'));
+  const addItem = inSheet('[data-add-item]');
+  assert(addItem, '阶段里没有「添加动作」按钮');
+  click(addItem);
+  assert(inSheet('[data-item-mode]'), '动作的模式按钮没渲染出来');
+});
+
+check('编辑器：间歇字段按秒填写、模型里存毫秒（单位不能错）', () => {
+  const planCard = document.querySelector('.sheet [data-stage]');
+  assert(planCard, '找不到阶段卡片');
+  const restInput = inSheet('[data-path^="stages.0.items.0.defaultRestMs"]');
+  assert(restInput, '找不到组间间歇输入框');
+  assert(restInput.dataset.sec === '1', '间歇字段缺少 data-sec 标记（会导致单位错乱）');
+  setInput(restInput, '120');
+  // 输入 120 秒 -> draft 里应是 120000 毫秒；通过保存后回读验证
+  click(inSheet('[data-save]'));
+  const saved = store.listPlans().find((p) => p.name === '新计划');
+  assert(saved, '新计划没保存成功');
+  const it = saved.stages[0].items[0];
+  assert(it.defaultRestMs === 120000, `组间间歇应为 120000ms，实际 ${it.defaultRestMs}`);
+  closeAnySheet();
+});
+
+check('编辑器：逐组编辑能切换到数组写法', () => {
+  closeAnySheet();
+  const firstCard = screen.querySelector('[data-plan]');
+  click(firstCard.querySelector('[data-edit]'));
+  const planId = firstCard.dataset.plan;
+  const before = store.getPlan(planId);
+  const item = before.stages.find((s) => (s.items || []).length).items[0];
+  const wasPerSet = Array.isArray(item.sets);
+  click(inSheet('[data-toggle-perset]'));
+  click(inSheet('[data-save]'));
+  const after = store.getPlan(planId);
+  const it2 = after.stages.find((s) => (s.items || []).length).items[0];
+  assert(Array.isArray(it2.sets) !== wasPerSet, '逐组/统一写法切换没生效');
+  closeAnySheet();
+});
+
+/* -------------------------------------------------------------- 二、训练流程 */
+
+let player = null;
+// 播放器持有的是「活对象」，而 store.getOngoing() 每次都会 JSON 解析出一份新副本，
+// 所以断言必须针对活对象，否则永远看不到刚产生的记录。
+let liveSession = null;
+
+check('训练播放器能开始并渲染第一组', () => {
+  closeAnySheet();
+  const plan = store.getPlan(pullup.id);
+  const session = sessionFromPlan(plan);
+  liveSession = session;
+  store.saveOngoing(session);
+  player = createPlayer({ store, session, onExit: () => {}, onFinish: () => {} });
+  screen.innerHTML = '';
+  screen.appendChild(player.root);
+  player.start();
+  assert(player.root.textContent.includes('弹力带肩袖外旋'), '第一组动作名不对');
+  assert(player.root.querySelector('[data-done]'), '没有「完成本组」按钮');
+});
+
+check('★ 完成本组后弹出「按计划推进 / 灵活调整」询问', () => {
+  click(player.root.querySelector('[data-done]'));
+  assert(sheet(), '询问浮层没打开');
+  const planBtn = inSheet('[data-plan]');
+  const flexBtn = inSheet('[data-flex]');
+  assert(planBtn, '缺少「按计划推进」按钮');
+  assert(flexBtn, '缺少「灵活调整」按钮');
+  assert(planBtn.textContent.includes('休息'), '「按计划推进」按钮上应带出计划休息时长');
+});
+
+check('★ 灵活调整面板显著显示「原计划间歇」作为参考', () => {
+  click(inSheet('[data-flex]'));
+  const banner = inSheet('.ref-banner');
+  assert(banner, '灵活调整面板里没有原计划参考条');
+  const session = liveSession;
+  const step = session.timeline[session.cursor];
+  assert(banner.textContent.includes('原计划间歇'), '参考条标题不对');
+  assert(banner.textContent.includes(fmtRest(step.restPlannedMs)),
+    `参考条应显示原计划 ${fmtRest(step.restPlannedMs)}，实际：${banner.textContent}`);
+  // 高亮「计划」那一档
+  const on = inSheet('[data-presets] .chip.is-on');
+  assert(on && on.textContent.includes('计划'), '快捷档位里「计划」那一档没有被高亮');
+});
+
+check('★ 灵活调整改时长后，记录里保留原计划 + 实际值', () => {
+  const session = liveSession;
+  const step = session.timeline[session.cursor];
+  const planned = step.restPlannedMs;
+  // 选一个不同于计划的档位
+  const chips = Array.from(document.querySelectorAll('.sheet [data-presets] .chip'));
+  const target = chips.find((c) => Number(c.dataset.ms) !== planned);
+  assert(target, '没有可选的其它档位');
+  click(target);
+  const chosen = Number(target.dataset.ms);
+  click(inSheet('[data-start]'));
+  const entry = session.entries[session.entries.length - 1];
+  assert(entry, '没有产生记录');
+  assert(entry.restPlannedMs === planned, `原计划应保留 ${planned}，实际 ${entry.restPlannedMs}`);
+  assert(entry.restActualMs === chosen, `实际应为 ${chosen}，实际 ${entry.restActualMs}`);
+  assert(entry.decision === 'flex', `decision 应为 flex，实际 ${entry.decision}`);
+});
+
+check('进入休息阶段：大数字倒计时 + 下一组信息 + 两个按钮', () => {
+  assert(player.root.querySelector('[data-ticker]'), '休息页没有倒计时数字');
+  assert(player.root.querySelector('[data-ring]'), '休息页没有进度环');
+  assert(player.root.querySelector('[data-next]'), '没有「开始下一组」');
+  assert(player.root.querySelector('[data-skip-rest]'), '没有「跳过休息」');
+  assert(player.root.textContent.includes('本次间歇'), '没显示本次采用的间歇时长');
+});
+
+check('跳过休息能推进到下一组，且组序前进', () => {
+  const before = store.getOngoing().cursor;
+  click(player.root.querySelector('[data-skip-rest]'));
+  const after = store.getOngoing().cursor;
+  assert(after === before, 'cursor 应在完成本组时已前进，跳过休息不应再动它');
+  assert(player.root.querySelector('[data-done]'), '没有回到「完成本组」界面');
+  assert(player.root.textContent.includes('悬垂肩胛') || player.root.textContent.includes('弹力带肩袖外旋'),
+    '下一组的动作名不对');
+});
+
+check('★ 结束训练同时有「结束并保存」和「结束，并不保存」，丢弃前有二次确认', () => {
+  closeAnySheet();
+  click(player.root.querySelector('[data-exit]'));
+  assert(sheet(), '结束确认弹层没打开');
+  assert(inSheet('[data-abort]'), '缺少「结束并保存」');
+  assert(inSheet('[data-discard]'), '缺少「结束，并不保存」');
+  assert(inSheet('[data-continue]'), '缺少「继续训练」');
+
+  // 点「不保存」应当再要一次确认，避免误触把整次训练丢了
+  click(inSheet('[data-discard]'));
+  assert(sheet(), '丢弃没有弹二次确认');
+  assert(inSheet('[data-ok]'), '二次确认没有确认按钮');
+  assert(inSheet('[data-cancel]'), '二次确认没有取消按钮');
+  click(inSheet('[data-cancel]'));
+  closeAnySheet();
+});
+
+check('连续有氧段不弹询问、只走正计时', () => {
+  closeAnySheet();
+  if (player) player.destroy();
+  const cardio = store.getPlan(store.listPlans().find((p) => p.name === '长距离跑').id);
+  const session = sessionFromPlan(cardio);
+  store.saveOngoing(session);
+  player = createPlayer({ store, session, onExit: () => {}, onFinish: () => {} });
+  screen.innerHTML = '';
+  screen.appendChild(player.root);
+  player.start();
+  assert(player.root.textContent.includes('慢跑热身'), '有氧第一段不对');
+  click(player.root.querySelector('[data-done]'));
+  assert(!sheet(), '连续段不应弹出「按计划推进/灵活调整」询问');
+});
+
+check('训练播放器销毁不报错', () => {
+  if (player) player.destroy();
+  player = null;
+  assert(true);
+});
+
+/* -------------------------------------------------------------- 三、日历 */
+
+check('日历渲染当月网格与色点', () => {
+  closeAnySheet();
+  renderCalendar(screen, { store, onOpenSession: () => {} });
+  assert(screen.textContent.includes('年'), '没有年月标题');
+  const days = screen.querySelectorAll('[data-day]');
+  assert(days.length >= 28, `当月天数格子太少：${days.length}`);
+  assert(screen.querySelector('[data-day-panel]'), '没有当日详情面板');
+  // 日历只管日程，月度统计已经移到「统计」页，这里不该再出现
+  assert(!/本月\s*\d+\s*次/.test(screen.textContent), '日历里不该再显示「本月 X 次 · X 分钟」');
+});
+
+check('日历：点某天能看到训练记录', () => {
+  const today = localDateKey();
+  click(screen.querySelector(`[data-day="${today}"]`));
+  const panel = screen.querySelector('[data-day-panel]');
+  assert(panel.textContent.includes('引体日'), '今天的训练记录没显示出来');
+});
+
+check('日历：给某天安排计划', () => {
+  const today = localDateKey();
+  click(screen.querySelector(`[data-day="${today}"]`));
+  click(screen.querySelector('[data-add-plan]'));
+  assert(sheet(), '安排计划的弹层没打开');
+  const pick = inSheet('[data-pick]');
+  assert(pick, '没有可选的计划');
+  click(pick);
+  const day = store.getSchedule()[today];
+  assert(day.planned.length >= 1, '计划没写进日程');
+});
+
+check('日历：标休息日 / 安排计划可删除', () => {
+  const today = localDateKey();
+  click(screen.querySelector(`[data-day="${today}"]`));
+  click(screen.querySelector('[data-rest]'));
+  assert(store.getSchedule()[today].status === 'rest', '休息日状态没写上');
+  click(screen.querySelector(`[data-day="${today}"]`));
+  click(screen.querySelector('[data-rest]'));
+  assert(store.getSchedule()[today].status !== 'rest', '再点一次应取消休息日');
+  // 休息日按钮要和其他两个一样带图标，视觉才统一
+  assert(screen.querySelector('[data-rest] svg'), '休息日按钮缺少图标');
+  // 「清除标记」已经去掉
+  assert(!screen.querySelector('[data-clear]'), '「清除标记」按钮应该已经去掉');
+});
+
+check('日历：月份切换正常', () => {
+  const before = screen.textContent;
+  click(screen.querySelector('[data-next]'));
+  assert(screen.querySelectorAll('[data-day]').length >= 28, '下个月网格渲染失败');
+  click(screen.querySelector('[data-prev]'));
+  assert(screen.textContent.length > 0, '切回本月失败');
+  assert(before.length > 0);
+});
+
+check('日历：折叠态只有圆点，且没有展开按钮（纯手势）', () => {
+  renderCalendar(screen, { store, onOpenSession: () => {} });
+  const grid = screen.querySelector('[data-grid]');
+  assert(grid, '没有日历网格');
+  assert(!grid.classList.contains('is-open'), '默认应该是折叠态');
+  // 折叠态下每格只有一个统一的圆点标记，不该再按类别分色
+  const todayCell = screen.querySelector(`[data-day="${localDateKey()}"]`);
+  assert(todayCell.querySelector('.cal-mark:not(.is-none)'), '有训练的那天应该有圆点标记');
+  assert(!todayCell.querySelector('.dot.is-strength, .dot.is-cardio'), '日历里不该再出现类别色点');
+  assert(getComputedStyle(todayCell.querySelector('.cal-events')).display === 'none',
+    '折叠态不该显示当天条目');
+  assert(!screen.querySelector('[data-toggle]'), '展开/收起按钮应该已经去掉，只留手势');
+});
+
+// 跟手拖拽 + 松手吸附：这里用合成触摸事件模拟一次真实下滑
+async function swipeGrid(dy) {
+  const grid = screen.querySelector('[data-grid]');
+  const mk = (type, y) => {
+    const t = new Touch({ identifier: 1, target: grid, clientX: 120, clientY: y });
+    grid.dispatchEvent(new TouchEvent(type, {
+      bubbles: true, cancelable: true,
+      touches: type === 'touchend' ? [] : [t],
+      changedTouches: [t],
+    }));
+  };
+  const y0 = 400;
+  mk('touchstart', y0);
+  mk('touchmove', y0 + dy);
+  await sleep(30);                       // 给 speed 判定留出真实的时间差
+  mk('touchmove', y0 + dy);
+  mk('touchend', y0 + dy);
+  return screen.querySelector('[data-grid]');
+}
+
+/** 量"稳定后"的每格高度：先关掉过渡，读到的就是吸附目标值，不受动画中间态干扰 */
+function settledHeight(grid) {
+  grid.classList.add('is-instant');
+  const h = parseFloat(getComputedStyle(grid.querySelector('.cal-cell')).height);
+  grid.classList.remove('is-instant');
+  return h;
+}
+
+try {
+  const canTouch = (() => {
+    try { new Touch({ identifier: 1, target: document.body, clientX: 0, clientY: 0 }); new TouchEvent('touchstart'); return true; }
+    catch (e) { return false; }
+  })();
+
+  if (!canTouch) {
+    results.push('PASS  日历手势（本环境无法构造 Touch 事件，跳过模拟）');
+  } else {
+    renderCalendar(screen, { store, onOpenSession: () => {} });
+    const g0 = screen.querySelector('[data-grid]');
+    const collapsedRow = settledHeight(g0);
+
+    const g1 = await swipeGrid(220);                       // 向下拖一大截
+    assert(g1.classList.contains('is-open'), '下滑后应进入展开态');
+    const openCell = g1.querySelector(`[data-day="${localDateKey()}"]`);
+    assert(openCell.querySelectorAll('.cal-ev').length > 0, '展开后当天格子应列出练了什么');
+    // 行高要真的被撑开（跟手拖动的结果），而不是换个 class 而已
+    const openH = settledHeight(g1);
+    assert(openH > collapsedRow + 10, `展开后每格应明显变高：折叠 ${collapsedRow} → 展开 ${openH}`);
+
+    await sleep(400);                                     // 点击抑制窗口过期
+    const g2 = await swipeGrid(-220);                     // 再上滑收起
+    assert(!g2.classList.contains('is-open'), '上滑后应回到折叠态');
+    const afterH = settledHeight(g2);
+    assert(Math.abs(afterH - collapsedRow) < 2,
+      `收起后每格高度应回到折叠态（正方形）：折叠 ${collapsedRow}，收起后 ${afterH}`);
+    results.push('PASS  日历：跟手拖拽能展开，拖回能收起');
+  }
+} catch (e) {
+  results.push('FAIL  日历手势 :: ' + (e && e.message ? e.message : e));
+}
+
+/* ------------------------------------------- 三点五、补记训练与记录时长（异步） */
+
+// 「今天按计划练了，但没走播放器」——补记一下，不该逼着用户把组挨个点一遍
+try {
+  closeAnySheet();
+  renderCalendar(screen, { store, onOpenSession: () => {} });
+  const today = localDateKey();
+  const before = store.allSessions().filter((s) => s.dateKey === today).length;
+
+  click(screen.querySelector(`[data-day="${today}"]`));
+  click(screen.querySelector('[data-log]'));
+  assert(sheet(), '「记录训练」的弹层没打开');
+
+  // 默认是「按计划补记」，选第一个计划后填 40 分钟
+  const pickPlan = inSheet('[data-pick-plan]');
+  assert(pickPlan, '补记弹层里没有可选的计划');
+  click(pickPlan);
+  setInput(inSheet('[data-min]'), '40');
+  click(inSheet('[data-save-log]'));
+  await sleep(120);
+
+  const after = store.allSessions().filter((s) => s.dateKey === today);
+  assert(after.length === before + 1, `补记后今天的记录应多一条，实际 ${after.length - before} 条`);
+  const logged = after[after.length - 1];
+  assert(logged.source === 'manual', '补记的记录应标记为 manual');
+  assert(logged.loggedSec === 40 * 60, `补记时长应为 2400 秒，实际 ${logged.loggedSec}`);
+  assert(store.getSchedule()[today].status === 'done', '记录后当天应标成已完成');
+  assert(screen.querySelector('[data-day-panel]').textContent.includes('记录 ·'),
+    '日程面板里这条应标明是「记录」的');
+  assert(screen.querySelector('[data-log]').textContent.includes('记录训练'), '按钮文案应为「记录训练」');
+  results.push('PASS  日程里可以「按计划记录」一次训练');
+} catch (e) {
+  results.push('FAIL  按计划记录 :: ' + (e && e.message ? e.message : e));
+}
+
+// 「今天就练了个有氧」——只记类别 + 时长，几十秒搞定
+try {
+  closeAnySheet();
+  const today = localDateKey();
+  click(screen.querySelector(`[data-day="${today}"]`));
+  click(screen.querySelector('[data-log]'));
+  click(inSheet('[data-mode="quick"]'));
+  setInput(inSheet('[data-cat-input]'), '有氧');
+  setInput(inSheet('[data-min]'), '30');
+  click(inSheet('[data-save-log]'));
+  await sleep(120);
+
+  const quick = store.allSessions().filter((s) => s.dateKey === today).pop();
+  assert(quick.planName === '有氧', `补记标题应为「有氧」，实际「${quick.planName}」`);
+  assert(quick.planSnapshot.category === '有氧', '补记要保住类别，统计的「按类别」才认得出');
+  assert(quick.loggedSec === 1800, '简单记一笔的时长没存上');
+  assert(store.listCategories().includes('有氧'), '写过的类别下次还能直接选');
+  results.push('PASS  可以「简单记一笔」：只填类别 + 时长');
+} catch (e) {
+  results.push('FAIL  简单记一笔 :: ' + (e && e.message ? e.message : e));
+}
+
+// 统计的总时长要用「用户记的时长」，而不是 App 秒表的流逝时间
+try {
+  closeAnySheet();
+  // 给本周一条正常记录填一个和流逝时间明显不同的时长：填 45 分钟
+  const target = store.allSessions().find((s) => !s.source && s.entries && s.entries.length);
+  assert(target, '没有可用的正常训练记录');
+  target.loggedSec = 45 * 60;
+  store.commitSession(target);
+
+  renderStats(screen, { store });
+
+  // 期望值：有 loggedSec 用它，没有就回落自动计时 —— 这正是统计口径本身
+  const { start, end } = periodRange('week', localDateKey());
+  const expectedMin = store.allSessions()
+    .filter((s) => { const k = localDateKey(s.startedAt || 0); return k >= start && k <= end; })
+    .reduce((t, s) => t + Math.round(
+      (s.loggedSec != null ? s.loggedSec * 1000 : Math.max(0, (s.endedAt || 0) - (s.startedAt || 0))) / 60000), 0);
+
+  const big = screen.querySelector('.num');
+  assert(big, '统计页没有总时长数字');
+  const txt = big.textContent.trim();
+  const shownMin = Number((txt.match(/(\d+)\s*小时/) || [0, 0])[1]) * 60
+    + Number((txt.match(/(\d+)\s*分/) || [0, 0])[1]);
+  assert(shownMin === expectedMin,
+    `统计总时长应是 ${expectedMin} 分钟，页面上却是「${txt}」`);
+  assert(Array.from(screen.querySelectorAll('.chip')).some((c) => c.textContent.trim() === '记录'),
+    '统计列表里这类记录应有「记录」标记');
+  results.push('PASS  统计时长按用户记录的时长算（不是 App 计时）');
+} catch (e) {
+  results.push('FAIL  统计时长口径 :: ' + (e && e.message ? e.message : e));
+}
+
+// 正常跟练结束后，在详情里手填时长，统计跟着变
+try {
+  closeAnySheet();
+  const s0 = store.allSessions().find((x) => !x.source && x.entries && x.entries.length);
+  assert(s0, '没有可用的正常训练记录');
+  openSessionDetail(store, s0.id, () => {});
+  setInput(inSheet('[data-min]'), '55');
+  click(inSheet('[data-save-fb]'));
+  await sleep(120);
+  assert(store.getSession(s0.id).loggedSec === 55 * 60, '详情里填的时长没有存进记录');
+  results.push('PASS  训练详情里可以手填本次时长并保存');
+} catch (e) {
+  results.push('FAIL  手填训练时长 :: ' + (e && e.message ? e.message : e));
+}
+
+/* -------------------------------------------------------------- 四、统计 */
+
+check('统计页：周/月/年三种粒度 + 周期可前后翻 + 总时长', () => {
+  renderStats(screen, { store });
+  ['按周', '按月', '按年'].forEach((t) => assert(screen.textContent.includes(t), `缺少「${t}」`));
+  assert(screen.textContent.includes('训练总时长'), '没有训练总时长');
+  assert(screen.textContent.includes('平均每次'), '没有运动次数/平均每次');
+  assert(screen.textContent.includes('按类别'), '缺少「按类别」的分项统计');
+  assert(screen.textContent.includes('力量'), '按类别里应该列出「力量」（测试数据是引体日）');
+  assert(screen.querySelectorAll('[data-gran]').length === 3, '粒度切换应该是三个');
+  assert(screen.querySelector('[data-prev]'), '没有「上一个周期」按钮');
+  assert(screen.querySelector('[data-next]'), '没有「下一个周期」按钮');
+  assert(screen.querySelector('[data-session]'), '本周应有训练记录（测试数据就在今天）');
+
+  // 三种粒度都要能正常重绘
+  ['month', 'year', 'week'].forEach((g) => {
+    click(screen.querySelector(`[data-gran="${g}"]`));
+    assert(screen.textContent.includes('训练总时长'), `切到 ${g} 后没渲染出来`);
+  });
+});
+
+check('统计页：能翻到上一个周期，内容确实变了', () => {
+  renderStats(screen, { store });
+  const label = () => screen.textContent;
+  const before = label();
+  click(screen.querySelector('[data-prev]'));
+  assert(label() !== before, '翻到上一周期后内容没有任何变化');
+  assert(screen.textContent.includes('训练总时长'), '翻页后页面没渲染');
+  // 上一周不该有今天这条记录
+  assert(!screen.querySelector('[data-session]'), '上一周不该出现本周的训练记录');
+});
+
+check('打开记录详情：逐组记录 + 调整留痕', () => {
+  // 上一项检查把统计页翻到了"上一周期"（那里没有记录），这里先切回当前周期
+  renderStats(screen, { store });
+  click(screen.querySelector('[data-session]'));
+  assert(sheet(), '详情弹层没打开');
+  assert(inSheet('[data-rpe]'), '没有 RPE 滑块');
+  assert(sheet().textContent.includes('灵活调整') || sheet().textContent.includes('调整'),
+    '没有显示过程调整留痕');
+});
+
+check('保存训练感受', () => {
+  setInput(inSheet('[data-rpe]'), '8');
+  inSheet('[data-rpe]').dispatchEvent(new Event('input', { bubbles: true }));
+  click(inSheet('[data-feel]'));
+  click(inSheet('[data-pain]'));
+  setInput(inSheet('[data-note]'), '状态不错');
+  setInput(inSheet('[data-next]'), '下次把最后一组加到 8 次');
+  click(inSheet('[data-save-fb]'));
+  const s = store.getSession(finished.id);
+  assert(s.feedback, '感受没保存');
+  assert(s.feedback.rpe === 8, `RPE 应为 8，实际 ${s.feedback.rpe}`);
+  assert(s.feedback.nextTimeNote.includes('8 次'), '「下次想调整什么」没存上');
+  assert(s.feedback.pain.parts.length === 1, '不适部位没存上');
+});
+
+/* -------------------------------------------------------------- 五、外壳 */
+
+// 这一项是异步的，单独写、单独 await —— 不能塞进同步的 check()，
+// 否则会在 await 之前就先把 PASS 记上，等于假通过。
+try {
+  closeAnySheet();
+  await import('../../www/js/main.js');
+  const tabbar = document.getElementById('tabbar');
+  assert(tabbar, '没有 tabbar');
+  for (const t of ['plans', 'train', 'calendar', 'stats']) {
+    click(tabbar.querySelector(`[data-tab="${t}"]`));
+    assert(document.getElementById('screen').innerHTML.length > 50, `切到 ${t} 后页面是空的`);
+  }
+  results.push('PASS  完整应用能启动（四个 Tab 都能切）');
+} catch (e) {
+  results.push('FAIL  完整应用能启动 :: ' + (e && e.message ? e.message : e));
+}
+
+/* ------------------------------------------------------- 六、设置与备份 */
+
+let exported = '';
+
+try {
+  closeAnySheet();
+  click(document.getElementById('btn-settings'));
+  assert(sheet(), '设置弹层没打开');
+  ['[data-timeout]', '[data-export]', '[data-import]', '[data-wipe]']
+    .forEach((sel) => assert(inSheet(sel), `设置里缺少 ${sel}`));
+  assert(!inSheet('[data-reset-samples]'), '「恢复内置示例计划」应该已经去掉');
+  results.push('PASS  设置弹层能打开且字段齐全');
+} catch (e) {
+  results.push('FAIL  设置弹层 :: ' + (e && e.message ? e.message : e));
+}
+
+try {
+  click(inSheet('[data-export]'));
+  const ta = inSheet('[data-out]');
+  assert(ta, '导出文本框没有出现');
+  exported = ta.value;
+  const parsed = JSON.parse(exported);
+  assert(parsed.format === 'exercise-record', '导出的 JSON 缺少格式标识');
+  assert(parsed.data && Array.isArray(parsed.data.plans) && parsed.data.plans.length > 0,
+    '导出的 JSON 里没有计划数据');
+  assert(parsed.data.sessions && typeof parsed.data.sessions === 'object', '导出的 JSON 里没有训练记录');
+  results.push('PASS  导出为文本：可解析且格式正确');
+} catch (e) {
+  results.push('FAIL  导出 :: ' + (e && e.message ? e.message : e));
+}
+
+try {
+  click(inSheet('[data-close2]'));           // 关掉导出层，回到设置
+  assert(inSheet('[data-import]'), '关掉导出层后没回到设置');
+  click(inSheet('[data-import]'));
+  const ta = inSheet('[data-in]');
+  assert(ta, '导入文本框没有出现');
+  ta.value = exported;
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  click(inSheet('[data-do]'));
+  await sleep(200);
+
+  // 合并导入自己的备份 = 没有任何变化；计划数不该翻倍
+  const tabbar = document.getElementById('tabbar');
+  click(tabbar.querySelector('[data-tab="plans"]'));
+  const cards = document.querySelectorAll('#screen [data-plan]').length;
+  assert(cards === 5, `合并导入后计划数应仍是 5，实际 ${cards}`);
+  results.push('PASS  合并导入自己的备份不产生重复数据');
+} catch (e) {
+  results.push('FAIL  导入 :: ' + (e && e.message ? e.message : e));
+}
+
+try {
+  // 导入非法内容要给出提示而不是抛异常搞崩页面
+  closeAnySheet();
+  click(document.getElementById('btn-settings'));
+  click(inSheet('[data-import]'));
+  const ta = inSheet('[data-in]');
+  ta.value = '{不是合法 JSON';
+  ta.dispatchEvent(new Event('input', { bubbles: true }));
+  click(inSheet('[data-do]'));
+  await sleep(120);
+  const toastEl = document.getElementById('toast');
+  assert(toastEl && toastEl.textContent.includes('失败'), '导入非法内容没有给出失败提示');
+  closeAnySheet();
+  results.push('PASS  导入非法内容给出提示且不崩页面');
+} catch (e) {
+  results.push('FAIL  非法导入处理 :: ' + (e && e.message ? e.message : e));
+}
+
+/* --------------------------------------------------- 七、类别长按删除（异步） */
+
+// 长按 550ms 后弹二次确认，点确定才真的删 —— 这一项必须等定时器，所以单独 await
+try {
+  closeAnySheet();
+  renderPlans(screen, { store, onStart: () => {} });
+  click(screen.querySelector('[data-new]'));
+  const chips = Array.from(document.querySelectorAll('.sheet [data-cat]'));
+  assert(chips.length >= 2, '类别标签太少，测不了长按删除');
+  const target = chips[chips.length - 1];
+  const name = target.dataset.cat;
+  const before = chips.length;
+
+  target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 12, clientY: 12 }));
+  await sleep(700);                                  // 超过长按阈值 550ms
+  target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+  const okBtn = inSheet('[data-ok]');
+  assert(okBtn, `长按「${name}」后应该弹出删除确认`);
+  assert(store.listCategories().includes(name), '还没点确认就不该真删');
+  click(okBtn);
+  await sleep(120);
+
+  const after = Array.from(document.querySelectorAll('.sheet [data-cat]'));
+  assert(after.length === before - 1, `删除后类别数应为 ${before - 1}，实际 ${after.length}`);
+  assert(!store.listCategories().includes(name), `「${name}」没从可选项里删掉`);
+  closeAnySheet();
+  results.push('PASS  长按类别可以删除（要二次确认）');
+} catch (e) {
+  results.push('FAIL  长按删除类别 :: ' + (e && e.message ? e.message : e));
+}
+
+/* ------------------------------------------- 八、2026-11-02 审计的回归守卫 */
+
+/*
+ * 下面这几项对着的是只读审计里查出来的具体缺陷。
+ * 原来那 35 项集成测试一条都没覆盖它们，全绿也拦不住再犯。
+ */
+
+// ① 导入的脏数据不能被当成 HTML 执行（反馈里的 RPE、组序都拼进 innerHTML）
+try {
+  const evil = '<img src=x onerror="window.__xss=1">';
+  const bad = sessionFromPlan(pullup, Date.now());
+  bad.cursor = 0;
+  completeStep(bad, { reps: 8 });
+  bad.entries[0].setIndex = evil;                 // 组序被塞成 HTML
+  bad.entries[0].itemName = evil;
+  finishSession(bad, 'done', Date.now());
+  bad.feedback = { rpe: evil, feel: [], pain: { parts: [] }, note: '', nextTimeNote: '' };
+  store.commitSession(bad);
+
+  window.__xss = 0;
+  renderCalendar(screen, { store, onOpenSession: () => {} });
+  openSessionDetail(store, bad.id, () => {});
+  await sleep(300);
+  assert(window.__xss === 0, '拼进 innerHTML 的脏数据被当成 HTML 执行了');
+  closeAnySheet();
+  results.push('PASS  导入的脏数据不会在日历/详情里执行脚本');
+} catch (e) {
+  results.push('FAIL  脏数据注入 :: ' + (e && e.message ? e.message : e));
+}
+
+// ② 「跳过这一组」以前是个坏按钮：调 removeStep(current) 拿到 null 却不检查，
+//    界面照样弹「已跳过本组」，用户被卡在同一组
+try {
+  const s3 = sessionFromPlan(pullup);
+  const total = s3.timeline.length;
+  const holder = document.createElement('div');
+  document.body.appendChild(holder);
+  const player = createPlayer({ store, session: s3, onExit: () => {}, onFinish: () => {}, onDiscarded: () => {} });
+  holder.appendChild(player.root);
+  player.start();
+  await sleep(60);
+
+  const skipBtn = player.root.querySelector('[data-skip]');
+  assert(skipBtn, '训练界面没有「跳过这一组」按钮');
+  click(skipBtn);
+  await sleep(60);
+
+  assert(s3.timeline.length === total - 1,
+    `跳过后时间线应少一组，实际 ${s3.timeline.length}/${total}`);
+  assert(s3.adjustments.some((a) => a.field === 'skip'), '跳过没有留痕');
+  const toastEl = document.getElementById('toast');
+  assert(toastEl && toastEl.textContent.includes('跳过'), '跳过后没有提示');
+
+  player.destroy();
+  holder.remove();
+  store.clearOngoing();
+  results.push('PASS  「跳过这一组」真的能跳掉当前这一组');
+} catch (e) {
+  results.push('FAIL  跳过这一组 :: ' + (e && e.message ? e.message : e));
+}
+
+// ③ 翻月时选中日也要跟着走：以前只改 month，网格是下个月、面板还写着上个月的日子
+try {
+  closeAnySheet();
+  renderCalendar(screen, { store, onOpenSession: () => {} });
+  click(screen.querySelector('button[data-next]'));
+  await sleep(80);
+
+  const headings = Array.from(screen.querySelectorAll('h3')).map((h) => h.textContent.trim());
+  const gridH = headings.find((t) => t.includes('年') && t.includes('月'));
+  const panelH = headings.find((t) => /\d+\s*月\s*\d+\s*日/.test(t));
+  assert(gridH && panelH, '日历上找不到月份标题');
+  const gm = Number((gridH.match(/(\d+)\s*月/) || [])[1]);
+  const pm = Number((panelH.match(/(\d+)\s*月/) || [])[1]);
+  assert(gm === pm, `翻月后网格是 ${gm} 月、下面面板还是 ${pm} 月`);
+  results.push('PASS  日历翻月后下面面板跟着换月');
+} catch (e) {
+  results.push('FAIL  日历翻月 :: ' + (e && e.message ? e.message : e));
+}
+
+// ④ 弹层开合要同步原生的"键盘让位"开关
+//    （以前只有 closeSheet 会发 false，true 从来没发出去，原生那套 IME inset 等于没启用）
+try {
+  const calls = [];
+  window.Capacitor = {
+    isNativePlatform: () => true,
+    Plugins: {
+      RestTimer: {
+        update: async () => ({ ok: true }),
+        stop: async () => ({ ok: true }),
+        restDone: async () => ({ ok: true }),
+        getState: async () => ({ state: '' }),
+        consumeOpenTrain: async () => ({ open: false }),
+        setKeyboardMode: async (a) => { calls.push(a); return { ok: true }; },
+      },
+    },
+  };
+  closeAnySheet();
+  openSheet({ title: '测试弹层', body: '<p>内容</p>' });
+  await sleep(80);
+  assert(calls.some((c) => c && c.sheetOpen === true), '弹层打开时没有通知原生开启键盘让位');
+  closeSheet();
+  await sleep(80);
+  assert(calls.some((c) => c && c.sheetOpen === false), '弹层关闭时没有通知原生关闭键盘让位');
+  delete window.Capacitor;
+  results.push('PASS  弹层开合会同步原生的键盘让位开关');
+} catch (e) {
+  results.push('FAIL  键盘让位开关 :: ' + (e && e.message ? e.message : e));
+}
+
+// ⑤ 长按类别→删除确认→点「取消」，编辑器必须还在
+//    （确认框是另开的弹层，会顺手把编辑器关掉；以前取消后整个编辑器消失、改动静默丢失）
+try {
+  closeAnySheet();
+  store.rememberCategory('测试类别');          // 保证至少有两个可点的类别
+  renderPlans(screen, { store, onStart: () => {} });
+  click(screen.querySelector('[data-new]'));
+  const chips = Array.from(document.querySelectorAll('.sheet [data-cat]'));
+  assert(chips.length >= 2, '类别标签太少，测不了长按删除');
+  const target = chips[chips.length - 1];
+
+  target.dispatchEvent(new MouseEvent('mousedown', { bubbles: true, clientX: 12, clientY: 12 }));
+  await sleep(700);
+  target.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+
+  const cancelBtn = inSheet('[data-cancel]');
+  assert(cancelBtn, '长按后应该弹出删除确认');
+  click(cancelBtn);
+  await sleep(150);
+
+  const editor = document.querySelector('.sheet');
+  assert(editor, '点了「取消」之后编辑器整个消失了');
+  assert(editor.querySelector('[data-path="name"]'), '取消之后编辑器内容不对（应该是计划编辑器）');
+  closeAnySheet();
+  results.push('PASS  长按类别后点「取消」，编辑器不会被关掉');
+} catch (e) {
+  results.push('FAIL  取消删除确认 :: ' + (e && e.message ? e.message : e));
+}
+
+/* ---------------------------------------------------------------- 输出 */
+
+await sleep(300);
+const out = document.getElementById('out');
+const fails = results.filter((r) => r.startsWith('FAIL'));
+out.textContent = JSON.stringify({
+  total: results.length,
+  failed: fails.length,
+  errors,
+  results,
+}, null, 1);
+</script>
+</body>
+</html>
